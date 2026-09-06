@@ -6,6 +6,7 @@ on:
     paths-ignore:
       - 'CHANGELOG.md'
       - 'Cargo.toml'
+      - 'Cargo.lock'
       - 'src/lib.rs'
   workflow_dispatch:
 
@@ -35,7 +36,9 @@ jobs:
           echo "Current version: $current_version"
           
           # Check for commits since last tag
-          last_tag=$(git describe --tags --match "v*" 2>/dev/null || echo "")
+          # --abbrev=0 is required: without it describe returns "v1.2.3-9-gabc1234",
+          # which git resolves back to HEAD, making the range below empty.
+          last_tag=$(git describe --tags --abbrev=0 --match "v*" 2>/dev/null || echo "")
           
           if [ -z "$last_tag" ]; then
             log_range="HEAD"
@@ -50,8 +53,10 @@ jobs:
           
           # Check for conventional commits
           has_breaking=$(echo "$commit_log" | grep -q "^BREAKING CHANGE:" && echo "true" || echo "false")
-          has_feat=$(echo "$commit_log" | grep -q "^feat" && echo "true" || echo "false")
-          has_fix=$(echo "$commit_log" | grep -q "^fix" && echo "true" || echo "false")
+          has_feat=$(echo "$commit_log" | grep -qE "^feat(\(.+\))?!?:" && echo "true" || echo "false")
+          has_fix=$(echo "$commit_log" | grep -qE "^fix(\(.+\))?!?:" && echo "true" || echo "false")
+
+          echo "breaking=$has_breaking feat=$has_feat fix=$has_fix"
           
           # Determine version bump
           if [ "$has_breaking" = "true" ]; then
