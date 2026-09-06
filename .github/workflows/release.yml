@@ -1,0 +1,98 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build and publish"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86_64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            binary: drift
+            asset: drift-linux-x86_64
+          - name: Windows x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary: drift.exe
+            asset: drift-windows-x86_64.exe
+          - name: macOS Intel
+            os: macos-latest
+            target: x86_64-apple-darwin
+            binary: drift
+            asset: drift-macos-x86_64
+          - name: macOS Apple Silicon
+            os: macos-latest
+            target: aarch64-apple-darwin
+            binary: drift
+            asset: drift-macos-aarch64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Build release binary
+        run: cargo build --locked --release --target ${{ matrix.target }}
+      - name: Prepare release asset
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" "artifacts/${{ matrix.asset }}"
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            sha256sum "artifacts/${{ matrix.asset }}" > "artifacts/${{ matrix.asset }}.sha256"
+          else
+            shasum -a 256 "artifacts/${{ matrix.asset }}" > "artifacts/${{ matrix.asset }}.sha256"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: artifacts/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Resolve release tag
+        id: release
+        shell: bash
+        env:
+          EVENT_TAG: ${{ github.ref_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          tag="${EVENT_TAG}"
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            tag="${INPUT_TAG}"
+          fi
+          [[ "$tag" == v* ]] || { echo "Tag must start with v: $tag" >&2; exit 1; }
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ steps.release.outputs.tag }}" artifacts/* \
+            --title "${{ steps.release.outputs.tag }}" \
+            --generate-notes

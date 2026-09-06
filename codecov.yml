@@ -1,0 +1,23 @@
+codecov:
+  require_ci_to_pass: false
+  precision: 2
+  round: down
+  layout: reach,diff,flags,files
+
+coverage:
+  precision: 2
+  round: down
+  range:
+    - 70
+    - 100
+
+flags:
+  rust:
+    carryforward: true
+
+comment:
+  layout: reach,diff,flags,files
+  require_changes: false
+  require_base: false
+  require_head: false
+  behavior: default

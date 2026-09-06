@@ -1,0 +1,40 @@
+repos:
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo-fmt
+        language: system
+        entry: cargo fmt --all -- --check
+        pass_filenames: false
+      - id: cargo-clippy
+        name: cargo-clippy
+        language: system
+        entry: cargo clippy --all-targets --all-features -- -D warnings
+        pass_filenames: false
+      - id: cargo-test
+        name: cargo-test
+        language: system
+        entry: cargo test --all-targets
+        pass_filenames: false
+
+  # common checks that aren't supported by the linters we use in this service
+  # i.e. in a project that uses prettier, you don't need the json checks
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: check-added-large-files
+      - id: check-json
+      - id: check-toml
+      - id: check-xml
+
+  - repo: https://github.com/antonbabenko/pre-commit-terraform
+    rev: v1.90.0
+    hooks:
+      - id: terraform_fmt
+      - id: terraform_validate  # this step might take a minute the first time it runs
+
+  - repo: https://github.com/compilerla/conventional-pre-commit
+    rev: v3.2.0
+    hooks:
+      - id: conventional-pre-commit
+        stages: [ commit-msg ]
