@@ -1,5 +1,5 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use drift::streaming::{PatchBatcher, StreamingArrayDiffer, StreamingObjectDiffer};
+use drift::streaming::{StreamingArrayDiffer, StreamingObjectDiffer};
 use drift::{diff, list_json_paths, patch};
 use serde_json::{json, Value};
 
@@ -221,49 +221,6 @@ fn bench_streaming_object_diff(c: &mut Criterion) {
     });
 }
 
-fn bench_patch_batching(c: &mut Criterion) {
-    c.bench_function("patch_batcher_1000_ops_batch_100", |b| {
-        b.iter(|| {
-            let mut batcher = PatchBatcher::new(100);
-
-            for i in 0..1000 {
-                let op = drift::Delta::new(drift::Operation::Remove, format!("/items/{}", i));
-                batcher.push(op);
-            }
-            batcher.flush();
-        })
-    });
-}
-
-fn bench_patch_batching_vs_unbatched(c: &mut Criterion) {
-    let mut group = c.benchmark_group("patch_batching_comparison");
-
-    // Individual operations
-    group.bench_function("unbatched_patch_100_ops", |b| {
-        b.iter(|| {
-            let mut ops = Vec::new();
-            for i in 0..100 {
-                ops.push(drift::Delta::new(drift::Operation::Remove, format!("/items/{}", i)));
-            }
-            ops
-        })
-    });
-
-    // Batched operations
-    group.bench_function("batched_patch_100_ops_batch_25", |b| {
-        b.iter(|| {
-            let mut batcher = PatchBatcher::new(25);
-            for i in 0..100 {
-                let op = drift::Delta::new(drift::Operation::Remove, format!("/items/{}", i));
-                batcher.push(op);
-            }
-            batcher.flush()
-        })
-    });
-
-    group.finish();
-}
-
 criterion_group!(
     benches,
     // Small objects
@@ -286,8 +243,6 @@ criterion_group!(
     bench_streaming_array_diff,
     bench_streaming_vs_standard_diff,
     bench_streaming_object_diff,
-    bench_patch_batching,
-    bench_patch_batching_vs_unbatched,
 );
 
 criterion_main!(benches);

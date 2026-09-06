@@ -186,44 +186,6 @@ impl StreamingObjectDiffer {
     }
 }
 
-/// Batches multiple patch operations for efficiency.
-///
-/// Instead of applying patches one by one (which traverses the tree for each),
-/// group related operations together.
-///
-/// # Performance
-/// - Reduces tree traversals from O(ops) to O(ops/batch_size)
-/// - Applies operations in batches, reducing memory allocations
-pub struct PatchBatcher {
-    batch_size: usize,
-    current_batch: Vec<Delta>,
-}
-
-impl PatchBatcher {
-    /// Creates a new patch batcher with specified batch size.
-    pub fn new(batch_size: usize) -> Self {
-        PatchBatcher { batch_size, current_batch: Vec::new() }
-    }
-
-    /// Adds an operation to the batch.
-    ///
-    /// Returns the batch if it's full, otherwise returns empty vector.
-    pub fn push(&mut self, op: Delta) -> Vec<Delta> {
-        self.current_batch.push(op);
-
-        if self.current_batch.len() >= self.batch_size {
-            std::mem::take(&mut self.current_batch)
-        } else {
-            Vec::new()
-        }
-    }
-
-    /// Flushes remaining operations in the batch.
-    pub fn flush(&mut self) -> Vec<Delta> {
-        std::mem::take(&mut self.current_batch)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -306,22 +268,5 @@ mod tests {
         differ.diff_batch(&old_pairs, &new_pairs);
 
         assert_eq!(differ.finalize(), crate::diff(&new, &old));
-    }
-
-    #[test]
-    fn test_patch_batcher() {
-        let mut batcher = PatchBatcher::new(3);
-
-        let batch1 = batcher.push(Delta::new(Operation::Remove, "/a".to_string()));
-        assert!(batch1.is_empty());
-
-        let batch2 = batcher.push(Delta::new(Operation::Remove, "/b".to_string()));
-        assert!(batch2.is_empty());
-
-        let batch3 = batcher.push(Delta::new(Operation::Remove, "/c".to_string()));
-        assert_eq!(batch3.len(), 3);
-
-        let remaining = batcher.flush();
-        assert!(remaining.is_empty());
     }
 }

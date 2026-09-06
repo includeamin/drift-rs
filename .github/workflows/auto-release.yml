@@ -100,6 +100,11 @@ jobs:
           new_version="${{ needs.check-release.outputs.new_version }}"
           sed -i "s/pub const VERSION: &str = .*/pub const VERSION: \&str = \"$new_version\";/" src/lib.rs
 
+      - name: Sync Cargo.lock
+        shell: bash
+        # Updates the workspace member version only; third-party deps stay pinned.
+        run: cargo update --workspace
+
       - name: Generate changelog
         shell: bash
         run: |
@@ -122,7 +127,8 @@ jobs:
 
       - name: Verify build
         shell: bash
-        run: cargo build
+        # Matches release.yml so a stale lock fails here, not after tagging.
+        run: cargo build --locked
 
       - name: Create release commit and tag
         shell: bash
@@ -137,7 +143,7 @@ jobs:
           git config --local user.name "github-actions[bot]"
           
           if [ -n "$(git status --porcelain)" ]; then
-            git add Cargo.toml src/lib.rs CHANGELOG.md
+            git add Cargo.toml Cargo.lock src/lib.rs CHANGELOG.md
             git commit -m "chore(release): bump to $new_version"
             git push origin main
           fi

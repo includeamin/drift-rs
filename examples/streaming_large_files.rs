@@ -7,7 +7,7 @@
 //!
 //! Run with: `cargo run --example streaming_large_files`
 
-use drift::streaming::{PatchBatcher, StreamingArrayDiffer, StreamingObjectDiffer};
+use drift::streaming::{StreamingArrayDiffer, StreamingObjectDiffer};
 use drift::{diff, diff_files, Delta};
 use serde_json::{json, Value};
 use std::fs::File;
@@ -133,25 +133,6 @@ fn example_streaming_object_diff() {
     println!("  operations: {}", differ.finalize().len());
 }
 
-/// Example 4: grouping operations before applying them.
-fn example_patch_batching() {
-    println!("\n=== Example 4: Patch batching ===");
-
-    let mut batcher = PatchBatcher::new(100);
-    let mut batches = 0;
-
-    for i in 0..500 {
-        if !batcher.push(Delta::new(drift::Operation::Remove, format!("/items/{i}"))).is_empty() {
-            batches += 1;
-        }
-    }
-    if !batcher.flush().is_empty() {
-        batches += 1;
-    }
-
-    println!("  500 operations -> {batches} batches of 100");
-}
-
 fn main() -> std::io::Result<()> {
     println!("drift - large file examples");
     println!("===========================");
@@ -159,7 +140,6 @@ fn main() -> std::io::Result<()> {
     example_automatic_streaming()?;
     example_streaming_array_diff();
     example_streaming_object_diff();
-    example_patch_batching();
 
     println!("\nDone.");
     Ok(())
