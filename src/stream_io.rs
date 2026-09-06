@@ -5,19 +5,24 @@
 //! the whole document, everything else is loaded normally. Both paths emit
 //! identical operations; the choice only affects peak memory.
 
-use crate::{diff, streaming::StreamingArrayDiffer, Delta, DriftError};
+use crate::diff::diff_inner;
+use crate::scan::{scan_object_members, Kind, Member};
+use crate::{diff, join_pointer, streaming::StreamingArrayDiffer, Delta, DriftError};
 use serde::de::{DeserializeSeed, Deserializer, SeqAccess, Visitor};
 use serde_json::Value;
 use std::{
+    collections::BTreeMap,
     fmt,
     fs::File,
-    io::{BufRead, BufReader, Read},
+    io::{BufRead, BufReader, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     sync::mpsc::{sync_channel, Receiver, SyncSender},
 };
 
 /// Inputs above this size are candidates for streaming.
 const STREAM_THRESHOLD_BYTES: u64 = 32 * 1024 * 1024;
+/// Object members at least this large are streamed rather than parsed whole.
+const MEMBER_STREAM_THRESHOLD_BYTES: u64 = 1024 * 1024;
 /// Elements compared per chunk, and channel depth. Bounds peak memory.
 const STREAM_CHUNK: usize = 1024;
 
@@ -58,11 +63,12 @@ impl<'de> DeserializeSeed<'de> for ArrayStreamer {
     }
 }
 
-/// Parses `path` on a worker thread, yielding array elements one at a time.
+/// Parses the array in `path` between `start` and `end` on a worker thread,
+/// yielding elements one at a time.
 ///
 /// The bounded channel applies backpressure, so memory stays at O(STREAM_CHUNK)
 /// regardless of file size.
-fn stream_array(path: &Path) -> Receiver<Result<Value, String>> {
+fn stream_array_range(path: &Path, start: u64, end: u64) -> Receiver<Result<Value, String>> {
     let (tx, rx) = sync_channel(STREAM_CHUNK);
     let path: PathBuf = path.to_path_buf();
     std::thread::spawn(move || {
@@ -73,7 +79,15 @@ fn stream_array(path: &Path) -> Receiver<Result<Value, String>> {
                 return;
             }
         };
-        let mut deserializer = serde_json::Deserializer::from_reader(BufReader::new(file));
+        let mut file = file;
+        if start > 0 {
+            if let Err(error) = file.seek(SeekFrom::Start(start)) {
+                let _ = tx.send(Err(error.to_string()));
+                return;
+            }
+        }
+        let bounded = BufReader::new(file.take(end - start));
+        let mut deserializer = serde_json::Deserializer::from_reader(bounded);
         let streamer = ArrayStreamer { tx: tx.clone() };
         if let Err(error) = streamer.deserialize(&mut deserializer) {
             let _ = tx.send(Err(error.to_string()));
@@ -103,8 +117,9 @@ fn take_chunk(
 fn diff_streams(
     old_source: &mut dyn Iterator<Item = Result<Value, String>>,
     new_source: &mut dyn Iterator<Item = Result<Value, String>>,
+    path: &str,
 ) -> Result<Vec<Delta>, DriftError> {
-    let mut differ = StreamingArrayDiffer::new(String::new());
+    let mut differ = StreamingArrayDiffer::new(path.to_string());
     let mut old_chunk = Vec::with_capacity(STREAM_CHUNK);
     let mut new_chunk = Vec::with_capacity(STREAM_CHUNK);
     let mut index = 0usize;
@@ -163,21 +178,17 @@ fn diff_streams(
     Ok(differ.finalize())
 }
 
-/// Returns true when the first non-whitespace byte is `[`.
-fn starts_with_array(path: &Path) -> bool {
-    let Ok(file) = File::open(path) else {
-        return false;
-    };
+/// First non-whitespace byte, used to classify the document root.
+fn first_byte(path: &Path) -> Option<u8> {
+    let file = File::open(path).ok()?;
     let mut reader = BufReader::new(file);
     loop {
-        let Ok(buffer) = reader.fill_buf() else {
-            return false;
-        };
+        let buffer = reader.fill_buf().ok()?;
         if buffer.is_empty() {
-            return false;
+            return None;
         }
         if let Some(byte) = buffer.iter().find(|b| !b.is_ascii_whitespace()) {
-            return *byte == b'[';
+            return Some(*byte);
         }
         let consumed = buffer.len();
         reader.consume(consumed);
@@ -196,26 +207,147 @@ fn load_json(path: &Path) -> Result<Value, DriftError> {
     serde_json::from_str(&text).map_err(|error| DriftError::Parse(error.to_string()))
 }
 
-fn should_stream(old: &Path, new: &Path, threshold: u64) -> bool {
-    (file_len(old) > threshold || file_len(new) > threshold)
-        && starts_with_array(old)
-        && starts_with_array(new)
+/// Parses just one member's value out of the file.
+fn read_member(path: &Path, member: &Member) -> Result<Value, DriftError> {
+    let mut file = File::open(path).map_err(|error| DriftError::Io(error.to_string()))?;
+    file.seek(SeekFrom::Start(member.start)).map_err(|error| DriftError::Io(error.to_string()))?;
+    let bounded = BufReader::new(file.take(member.len()));
+    serde_json::from_reader(bounded).map_err(|error| DriftError::Parse(error.to_string()))
+}
+
+fn index_members(
+    path: &Path,
+    start: u64,
+    end: u64,
+) -> Result<BTreeMap<String, Member>, DriftError> {
+    let mut file = File::open(path).map_err(|error| DriftError::Io(error.to_string()))?;
+    if start > 0 {
+        file.seek(SeekFrom::Start(start)).map_err(|error| DriftError::Io(error.to_string()))?;
+    }
+    let members = scan_object_members(BufReader::new(file.take(end - start)))?;
+    // Scanner offsets are relative to the range, so rebase onto the file.
+    // Collecting into a map makes later duplicate keys win, as serde_json does.
+    Ok(members
+        .into_iter()
+        .map(|mut member| {
+            member.start += start;
+            member.end += start;
+            (member.key.clone(), member)
+        })
+        .collect())
+}
+
+/// Diffs two JSON objects member by member, streaming large arrays and
+/// recursing into large nested objects.
+///
+/// Emits operations in the same order as [`diff`]: removals, then additions,
+/// then per-key recursion, each in sorted key order.
+fn diff_objects(
+    old: &Path,
+    new: &Path,
+    old_range: (u64, u64),
+    new_range: (u64, u64),
+    path: &str,
+    member_threshold: u64,
+) -> Result<Vec<Delta>, DriftError> {
+    let old_members = index_members(old, old_range.0, old_range.1)?;
+    let new_members = index_members(new, new_range.0, new_range.1)?;
+    let mut operations = Vec::new();
+
+    for key in old_members.keys() {
+        if !new_members.contains_key(key) {
+            operations.push(Delta::new(crate::Operation::Remove, join_pointer(path, key)));
+        }
+    }
+
+    for (key, member) in &new_members {
+        if !old_members.contains_key(key) {
+            operations.push(Delta::with_value(
+                crate::Operation::Add,
+                join_pointer(path, key),
+                read_member(new, member)?,
+            ));
+        }
+    }
+
+    for (key, old_member) in &old_members {
+        let Some(new_member) = new_members.get(key) else {
+            continue;
+        };
+        let item_path = join_pointer(path, key);
+        let large = old_member.len() > member_threshold || new_member.len() > member_threshold;
+
+        match (old_member.kind, new_member.kind) {
+            (Kind::Array, Kind::Array) if large => {
+                let old_rx = stream_array_range(old, old_member.start, old_member.end);
+                let new_rx = stream_array_range(new, new_member.start, new_member.end);
+                operations.extend(diff_streams(
+                    &mut old_rx.into_iter(),
+                    &mut new_rx.into_iter(),
+                    &item_path,
+                )?);
+            }
+            (Kind::Object, Kind::Object) if large => {
+                operations.extend(diff_objects(
+                    old,
+                    new,
+                    (old_member.start, old_member.end),
+                    (new_member.start, new_member.end),
+                    &item_path,
+                    member_threshold,
+                )?);
+            }
+            _ => {
+                let old_value = read_member(old, old_member)?;
+                let new_value = read_member(new, new_member)?;
+                diff_inner(&new_value, &old_value, &item_path, &mut operations);
+            }
+        }
+    }
+
+    Ok(operations)
 }
 
 /// Diffs two JSON files, streaming automatically when it is worthwhile.
 ///
 /// Streaming is used when either file exceeds an internal size threshold and
-/// both hold a top-level array. The result is always identical to
-/// [`diff`] on the fully parsed documents.
+/// both roots are arrays, or both are objects whose large array members can be
+/// streamed individually. The result is always identical to [`diff`] on the
+/// fully parsed documents.
 pub fn diff_files(old: &Path, new: &Path) -> Result<Vec<Delta>, DriftError> {
     diff_files_with(old, new, STREAM_THRESHOLD_BYTES)
 }
 
 fn diff_files_with(old: &Path, new: &Path, threshold: u64) -> Result<Vec<Delta>, DriftError> {
-    if should_stream(old, new, threshold) {
-        let old_rx = stream_array(old);
-        let new_rx = stream_array(new);
-        return diff_streams(&mut old_rx.into_iter(), &mut new_rx.into_iter());
+    diff_files_tuned(old, new, threshold, MEMBER_STREAM_THRESHOLD_BYTES)
+}
+
+fn diff_files_tuned(
+    old: &Path,
+    new: &Path,
+    threshold: u64,
+    member_threshold: u64,
+) -> Result<Vec<Delta>, DriftError> {
+    let large = file_len(old) > threshold || file_len(new) > threshold;
+    if large {
+        match (first_byte(old), first_byte(new)) {
+            (Some(b'['), Some(b'[')) => {
+                let old_rx = stream_array_range(old, 0, file_len(old));
+                let new_rx = stream_array_range(new, 0, file_len(new));
+                return diff_streams(&mut old_rx.into_iter(), &mut new_rx.into_iter(), "");
+            }
+            (Some(b'{'), Some(b'{')) => {
+                return diff_objects(
+                    old,
+                    new,
+                    (0, file_len(old)),
+                    (0, file_len(new)),
+                    "",
+                    member_threshold,
+                )
+            }
+            _ => {}
+        }
     }
     let old_value = load_json(old)?;
     let new_value = load_json(new)?;
@@ -246,8 +378,9 @@ mod tests {
         let new_path = write_temp(&new);
 
         let expected = diff(&new, &old);
-        // threshold 0 forces streaming, u64::MAX forces the in-memory path
-        let streamed = diff_files_with(&old_path, &new_path, 0).unwrap();
+        // threshold 0 forces streaming, u64::MAX forces the in-memory path.
+        // member_threshold 0 also forces array members to stream.
+        let streamed = diff_files_tuned(&old_path, &new_path, 0, 0).unwrap();
         let loaded = diff_files_with(&old_path, &new_path, u64::MAX).unwrap();
 
         std::fs::remove_file(&old_path).ok();
@@ -313,13 +446,13 @@ mod tests {
     }
 
     #[test]
-    fn non_array_documents_use_in_memory_path() {
-        let old = json!({"a": 1});
-        let new = json!({"a": 2});
+    fn scalar_roots_use_in_memory_path() {
+        let old = json!("just a string");
+        let new = json!("another string");
         let old_path = write_temp(&old);
         let new_path = write_temp(&new);
 
-        // Even with the threshold at 0, an object cannot stream.
+        // Neither root is an array or object, so streaming cannot apply.
         let result = diff_files_with(&old_path, &new_path, 0).unwrap();
 
         std::fs::remove_file(&old_path).ok();
@@ -336,5 +469,183 @@ mod tests {
         let result = diff_files_with(&path, &path, 0);
         std::fs::remove_file(&path).ok();
         assert!(matches!(result, Err(DriftError::Parse(_))));
+    }
+
+    // ===== Top-level object roots =====
+
+    #[test]
+    fn streams_array_wrapped_in_object() {
+        let old = json!({"generated_at": "t0", "users": [{"id": 1, "name": "a"}, {"id": 2, "name": "b"}]});
+        let new = json!({"generated_at": "t1", "users": [{"id": 1, "name": "a"}, {"id": 2, "name": "CHANGED"}]});
+        assert_paths_agree(old, new);
+    }
+
+    #[test]
+    fn wrapped_array_produces_nested_paths() {
+        let old = json!({"users": [{"name": "a"}, {"name": "b"}]});
+        let new = json!({"users": [{"name": "a"}, {"name": "z"}]});
+        let old_path = write_temp(&old);
+        let new_path = write_temp(&new);
+
+        let operations = diff_files_tuned(&old_path, &new_path, 0, 0).unwrap();
+
+        std::fs::remove_file(&old_path).ok();
+        std::fs::remove_file(&new_path).ok();
+
+        assert_eq!(operations.len(), 1);
+        assert_eq!(operations[0].path, "/users/1/name");
+    }
+
+    #[test]
+    fn object_key_added_and_removed() {
+        assert_paths_agree(json!({"a": 1, "b": 2}), json!({"b": 2, "c": 3}));
+    }
+
+    #[test]
+    fn object_nested_value_changes() {
+        assert_paths_agree(
+            json!({"cfg": {"x": 1, "y": {"z": 2}}}),
+            json!({"cfg": {"x": 1, "y": {"z": 3}}}),
+        );
+    }
+
+    #[test]
+    fn object_member_type_changes() {
+        assert_paths_agree(json!({"a": [1, 2]}), json!({"a": {"b": 1}}));
+        assert_paths_agree(json!({"a": {"b": 1}}), json!({"a": [1, 2]}));
+        assert_paths_agree(json!({"a": [1, 2]}), json!({"a": "scalar"}));
+    }
+
+    #[test]
+    fn object_array_members_change_length() {
+        assert_paths_agree(json!({"a": [1, 2, 3]}), json!({"a": [1, 2]}));
+        assert_paths_agree(json!({"a": [1, 2]}), json!({"a": [1, 2, 3, 4]}));
+        assert_paths_agree(json!({"a": []}), json!({"a": [1]}));
+        assert_paths_agree(json!({"a": [1]}), json!({"a": []}));
+    }
+
+    #[test]
+    fn object_keys_needing_pointer_escaping() {
+        assert_paths_agree(json!({"a/b": 1, "c~d": 2}), json!({"a/b": 9, "c~d": 2}));
+    }
+
+    #[test]
+    fn object_keys_are_order_independent() {
+        // Same content, different serialization order, must produce no operations.
+        let old_path = write_temp(&json!({"a": 1, "b": 2}));
+        let new_path =
+            std::env::temp_dir().join(format!("drift_stream_ord_{}.json", std::process::id()));
+        std::fs::write(&new_path, br#"{"b":2,"a":1}"#).unwrap();
+
+        let operations = diff_files_tuned(&old_path, &new_path, 0, 0).unwrap();
+
+        std::fs::remove_file(&old_path).ok();
+        std::fs::remove_file(&new_path).ok();
+
+        assert!(operations.is_empty(), "expected no changes, got {operations:?}");
+    }
+
+    #[test]
+    fn empty_and_unchanged_objects() {
+        assert_paths_agree(json!({}), json!({}));
+        assert_paths_agree(json!({}), json!({"a": 1}));
+        assert_paths_agree(json!({"a": 1}), json!({}));
+        assert_paths_agree(json!({"a": 1}), json!({"a": 1}));
+    }
+
+    #[test]
+    fn object_members_spanning_many_chunks() {
+        let big_old: Vec<Value> = (0..STREAM_CHUNK * 2 + 5).map(|i| json!({"i": i})).collect();
+        let mut big_new = big_old.clone();
+        big_new[STREAM_CHUNK] = json!({"i": "boundary"});
+        big_new.push(json!({"i": "appended"}));
+
+        assert_paths_agree(
+            json!({"meta": {"v": 1}, "items": big_old}),
+            json!({"meta": {"v": 2}, "items": big_new}),
+        );
+    }
+
+    #[test]
+    fn mixed_roots_fall_back_to_loading() {
+        // One array root, one object root: cannot stream, must still be correct.
+        assert_paths_agree(json!([1, 2]), json!({"a": 1}));
+        assert_paths_agree(json!({"a": 1}), json!([1, 2]));
+    }
+
+    #[test]
+    fn reports_parse_errors_for_object_roots() {
+        let path =
+            std::env::temp_dir().join(format!("drift_stream_badobj_{}.json", std::process::id()));
+        std::fs::write(&path, br#"{"a": [1, 2"#).unwrap();
+        let result = diff_files_tuned(&path, &path, 0, 0);
+        std::fs::remove_file(&path).ok();
+        assert!(result.is_err(), "expected an error, got {result:?}");
+    }
+
+    // ===== Nested objects =====
+
+    #[test]
+    fn recurses_into_nested_objects() {
+        let old = json!({"data": {"users": [{"name": "a"}, {"name": "b"}]}});
+        let new = json!({"data": {"users": [{"name": "a"}, {"name": "z"}]}});
+        let old_path = write_temp(&old);
+        let new_path = write_temp(&new);
+
+        let operations = diff_files_tuned(&old_path, &new_path, 0, 0).unwrap();
+
+        std::fs::remove_file(&old_path).ok();
+        std::fs::remove_file(&new_path).ok();
+
+        assert_eq!(operations.len(), 1);
+        assert_eq!(operations[0].path, "/data/users/1/name");
+    }
+
+    #[test]
+    fn deeply_nested_objects_match_diff() {
+        assert_paths_agree(
+            json!({"a": {"b": {"c": {"d": {"e": [1, 2, 3]}}}}}),
+            json!({"a": {"b": {"c": {"d": {"e": [1, 9, 3, 4]}}}}}),
+        );
+    }
+
+    #[test]
+    fn nested_object_keys_added_and_removed() {
+        assert_paths_agree(
+            json!({"cfg": {"keep": 1, "drop": 2, "nest": {"x": 1}}}),
+            json!({"cfg": {"keep": 1, "add": 3, "nest": {"y": 2}}}),
+        );
+    }
+
+    #[test]
+    fn nested_escaped_keys_build_correct_pointers() {
+        assert_paths_agree(json!({"a/b": {"c~d": {"e": 1}}}), json!({"a/b": {"c~d": {"e": 2}}}));
+    }
+
+    #[test]
+    fn nested_mixed_kinds_fall_back_per_member() {
+        assert_paths_agree(
+            json!({"a": {"b": [1, 2]}, "c": {"d": 1}}),
+            json!({"a": {"b": {"x": 1}}, "c": {"d": [1]}}),
+        );
+    }
+
+    #[test]
+    fn nested_arrays_spanning_chunks() {
+        let big: Vec<Value> = (0..STREAM_CHUNK + 3).map(|i| json!({"i": i})).collect();
+        let mut changed = big.clone();
+        changed[STREAM_CHUNK] = json!({"i": "boundary"});
+
+        assert_paths_agree(
+            json!({"outer": {"inner": {"items": big}}}),
+            json!({"outer": {"inner": {"items": changed}}}),
+        );
+    }
+
+    #[test]
+    fn nested_empty_containers() {
+        assert_paths_agree(json!({"a": {"b": {}}}), json!({"a": {"b": {"c": 1}}}));
+        assert_paths_agree(json!({"a": {"b": {"c": 1}}}), json!({"a": {"b": {}}}));
+        assert_paths_agree(json!({"a": {}}), json!({"a": {}}));
     }
 }

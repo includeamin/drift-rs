@@ -66,15 +66,30 @@ assert_eq!(patch(old, &operations)?, new);
 
 ## Large files
 
-Streaming is automatic. There is no flag to set.
-
 `drift diff` and the `drift::diff_files` library function inspect the inputs and
-pick a strategy: when either file is larger than 32 MB and both hold a top-level
-JSON array, elements are parsed and compared incrementally and the full document
-is never materialised. Everything else is loaded normally.
+pick a strategy. When either file is larger than 32 MB:
+
+- **Array roots** (`[...]`) are compared element by element, streaming.
+- **Object roots** (`{...}`) are indexed by byte offset, then each member is
+  handled on its own: large array members stream, large object members recurse
+  the same way, everything else is parsed individually. So both
+  `{"users": [ ...900k... ]}` and `{"response": {"payload": {"users": [...] }}}`
+  stream the array without materialising it.
+
+Anything else is loaded normally.
 
 Both paths emit **exactly the same operations, in the same order**. The choice
-only affects peak memory.
+only affects peak memory, not speed — the work done is the same.
+
+| Input | Standard | Streaming |
+|-------|----------|-----------|
+| 47.5 MB array of 400k objects | 735 MB | 7.6 MB |
+| 36.9 MB `{"users": [600k], "meta": {}}` | 995 MB | 7 MB |
+| 36.9 MB `{"response": {"payload": {"users": [600k]}}}` | 995 MB | 7 MB |
+
+Peak memory for the in-memory path runs 15-27x the file size, because a
+`serde_json::Value` tree is much larger than its serialized form. The streaming
+path stays flat regardless of input size.
 
 ```rust
 use drift::diff_files;
@@ -88,7 +103,9 @@ Streaming is skipped when it cannot work or would change behaviour:
 
 - Input read from stdin (`-`), which is not re-readable
 - Non-JSON formats (YAML, TOML, XML)
-- Documents whose top-level value is not an array
+- Roots that are neither an array nor an object, or a mismatched pair
+- Members under 1 MB, and members that are neither an array nor an object, which
+  are parsed individually instead
 - `--grep`, which matches against values in the old document and therefore
   needs it fully loaded
 
@@ -124,45 +141,6 @@ A runnable walkthrough lives in
 cargo run --release --example streaming_large_files
 ```
 
-## Performance
-
-Streaming is **not faster** — it does the same work. The win is memory.
-
-Measured on a 5k-element array with one changed element:
-
-| Approach | Time |
-|----------|------|
-| Standard | 4.97 ms |
-| Streaming (chunk 500) | 4.71 ms |
-
-Measured on a 47.5 MB array of 400k objects:
-
-| Approach | Peak RSS |
-|----------|----------|
-| Standard | 735 MB |
-| Streaming | 7.6 MB |
-
-Peak memory for the in-memory path runs roughly 15x the file size, because a
-`serde_json::Value` tree is much larger than its serialized form. The streaming
-path stays flat regardless of input size.
-
-**Well suited to:** shallow documents, sparse changes, repeated diffs on
-similar data.
-
-**Costs to be aware of:** add/replace operations clone the value; inserting into
-the middle of an array shifts every later element; diff visits all nodes, even
-unchanged subtrees.
-
-### Benchmarks
-
-```bash
-cargo bench
-```
-
-Covers small/medium/large objects, deeply nested structures, path listing, and
-streaming vs standard diff. Results are written to `target/criterion/` with HTML
-reports.
-
 ## Build and test
 
 Rust 1.70 or newer is required:
@@ -172,7 +150,7 @@ cargo test
 cargo build --release
 ```
 
-The suite has 78 tests covering pointer operations, diff and patch behaviour,
-path listing, regex search and filtering, round-trip validation, unicode, and
-streaming/in-memory equivalence. Coverage reports are generated on pull requests
-via [Codecov](https://codecov.io).
+The suite has 112 tests covering pointer operations, diff and patch behaviour,
+path listing, regex search and filtering, round-trip validation, unicode,
+JSON offset scanning, and streaming/in-memory equivalence. Coverage reports are
+generated on pull requests via [Codecov](https://codecov.io).
