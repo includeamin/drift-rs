@@ -14,4 +14,8 @@ pub enum DriftError {
     Test(String),
     #[error("invalid regular expression: {0}")]
     Regex(String),
+    #[error("i/o error: {0}")]
+    Io(String),
+    #[error("parse error: {0}")]
+    Parse(String),
 }

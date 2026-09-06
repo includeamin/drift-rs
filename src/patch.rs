@@ -143,6 +143,32 @@ fn replace(mut document: Value, path: &str, value: Value) -> Result<Value, Drift
     Ok(document)
 }
 
+/// Applies RFC 6902 JSON Patch operations to a document.
+///
+/// # Performance Characteristics
+/// - **Time Complexity**: O(n * m) where n is operations count, m is path depth
+/// - **Space Complexity**: O(d) where d is the maximum nesting depth
+/// - **Mutations**: In-place modifications; no intermediate copies for most operations
+/// - **Array Operations**: Insert/remove in middle of arrays is O(n) due to element shifting
+/// - **Path Lookup**: Each operation requires tree traversal; deeply nested paths are slower
+///
+/// # Optimization Tips
+/// - Batch related operations to reduce path traversals
+/// - Avoid inserting into middle of large arrays (append instead)
+/// - Operations are applied sequentially; order matters for correctness
+/// - Consider applying operations to specific subtrees when possible
+///
+/// # Example
+/// ```
+/// use drift::{diff, patch};
+/// use serde_json::json;
+///
+/// let doc = json!({"x": 1});
+/// let new = json!({"x": 2});
+/// let ops = diff(&new, &doc);
+/// let result = patch(doc, &ops).unwrap();
+/// assert_eq!(result, new);
+/// ```
 pub fn patch(mut document: Value, operations: &[Delta]) -> Result<Value, DriftError> {
     for operation in operations {
         document = match operation.op {

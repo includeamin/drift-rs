@@ -2,11 +2,12 @@ pub mod formats;
 
 use self::formats::{dump, load, resolve, Format};
 use clap::{Args, Parser, Subcommand};
-use drift::{diff, filter_operations, patch, Delta, Operation, VERSION};
+use drift::{diff, diff_files, filter_operations, patch, Delta, Operation, VERSION};
 use serde_json::Value;
 use std::{
     fs,
     io::{self, Read},
+    path::Path,
 };
 
 #[derive(Parser)]
@@ -127,11 +128,24 @@ fn delta_json(delta: &Delta) -> Value {
 
 fn cmd_diff(args: DiffArgs) -> Result<i32, Box<dyn std::error::Error>> {
     let format = resolve(args.format, &args.old);
-    let old = load(&args.old, format)?;
-    let new = load(&args.new, format)?;
+
+    // `--grep` inspects old values, so it needs the whole old document in memory.
+    let delegate = matches!(format, Format::Json)
+        && args.old != "-"
+        && args.new != "-"
+        && args.values.is_empty();
+
+    let (diff_operations, old) = if delegate {
+        (diff_files(Path::new(&args.old), Path::new(&args.new))?, None)
+    } else {
+        let old = load(&args.old, format)?;
+        let new = load(&args.new, format)?;
+        (diff(&new, &old), Some(old))
+    };
+
     let operations = filter_operations(
-        &diff(&new, &old),
-        Some(&old),
+        &diff_operations,
+        old.as_ref(),
         &args.paths,
         &args.fields,
         &args.values,

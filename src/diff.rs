@@ -19,7 +19,7 @@ fn strict_equal(left: &Value, right: &Value) -> bool {
     }
 }
 
-fn diff_inner(new: &Value, old: &Value, path: &str, output: &mut Vec<Delta>) {
+pub(crate) fn diff_inner(new: &Value, old: &Value, path: &str, output: &mut Vec<Delta>) {
     match (new, old) {
         (Value::Object(new_obj), Value::Object(old_obj)) => {
             let old_keys: BTreeSet<_> = old_obj.keys().collect();
@@ -60,6 +60,30 @@ fn diff_inner(new: &Value, old: &Value, path: &str, output: &mut Vec<Delta>) {
     }
 }
 
+/// Calculates RFC 6902 JSON Patch operations needed to transform `old` into `new`.
+///
+/// # Performance Characteristics
+/// - **Time Complexity**: O(n) where n is the total number of nodes across both values
+/// - **Space Complexity**: O(n) for the output operations plus O(d) for recursion stack
+/// - **Cloning**: Each add/replace operation clones the new value tree
+/// - **Arrays**: Element-by-element comparison; middle changes trigger O(n) operations
+/// - **Objects**: Key set comparison using BTreeSet; O(k log k) for k keys
+///
+/// # Optimization Tips
+/// - For large objects, diff only changed subtrees when possible
+/// - Array insertions in the middle are less efficient than appends
+/// - Value cloning overhead grows with value size for add/replace operations
+///
+/// # Example
+/// ```
+/// use drift::diff;
+/// use serde_json::json;
+///
+/// let old = json!({"name": "Alice"});
+/// let new = json!({"name": "Bob"});
+/// let ops = diff(&new, &old);
+/// assert_eq!(ops.len(), 1);
+/// ```
 pub fn diff(new: &Value, old: &Value) -> Vec<Delta> {
     let mut output = Vec::new();
     diff_inner(new, old, "", &mut output);

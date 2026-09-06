@@ -5,6 +5,8 @@ mod patch;
 mod paths;
 mod pointer;
 mod search;
+mod stream_io;
+pub mod streaming;
 
 pub use diff::diff;
 pub use error::DriftError;
@@ -13,6 +15,7 @@ pub use patch::patch;
 pub use paths::list_json_paths;
 pub use pointer::{escape_token, join_pointer, split_pointer, unescape_token};
 pub use search::{filter_operations, path_matches};
+pub use stream_io::diff_files;
 
 pub const VERSION: &str = "0.13.0";
 
