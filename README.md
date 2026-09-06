@@ -3,9 +3,38 @@
 `drift` is a Rust library and command-line tool for calculating RFC 6902 JSON
 Patch operations between structured documents.
 
+## Installation
+
+Download and install the latest binary for your platform:
+
+```bash
+curl -fsSL https://github.com/includeamin/drift-rs/raw/main/install.sh | bash
+```
+
+Or clone and run the installer directly:
+
+```bash
+git clone https://github.com/includeamin/drift-rs.git
+cd drift-rs
+bash install.sh
+```
+
+The installer automatically detects your operating system and architecture, downloads the latest verified binary from GitHub releases, and installs it to `~/.local/bin`. No Rust toolchain required!
+
+**Options:**
+- Install a specific version: `bash install.sh --version v0.13.1`
+- Custom installation prefix: `PREFIX=$HOME/.cargo bash install.sh`
+- Custom binary directory: `BIN_DIR=/usr/local/bin bash install.sh`
+
+**Supported platforms:**
+- Linux x86_64
+- macOS Intel (x86_64)
+- macOS Apple Silicon (aarch64)
+- Windows x86_64
+
 ## Build and test
 
-Rust 1.70 or newer is required.
+To build from source, Rust 1.70 or newer is required:
 
 ```bash
 cargo test
@@ -22,24 +51,6 @@ The test suite includes 60+ tests covering:
 - Unicode and complex data structures
 
 Coverage reports are generated automatically on pull requests via [Codecov](https://codecov.io).
-
-## Releases
-
-Pushing a version tag such as `v0.13.1` builds native command-line binaries
-for Linux x86_64, Windows x86_64, macOS Intel, and macOS Apple Silicon. The
-GitHub release includes a SHA-256 checksum beside each binary. The workflow can
-also be started manually for an existing `v*` tag.
-
-Install the native executable with:
-
-```bash
-bash install.sh
-```
-
-The installer downloads and verifies the matching published release artifact;
-Cargo is not required. Install a specific release with
-`bash install.sh --version v0.13.1`. `PREFIX` and `BIN_DIR` can be overridden
-through environment variables.
 
 ## CLI
 
