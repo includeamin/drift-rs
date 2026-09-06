@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.13.0] - 2026-09-06
+- Release 0.13.0
+
+
 All notable changes to this project are documented here.
 ## [0.13.0] - 2026-08-31
 

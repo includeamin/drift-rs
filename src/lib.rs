@@ -14,7 +14,7 @@ pub use paths::list_json_paths;
 pub use pointer::{escape_token, join_pointer, split_pointer, unescape_token};
 pub use search::{filter_operations, path_matches};
 
-pub const VERSION: &str = "0.12.0";
+pub const VERSION: &str = "0.13.0";
 
 #[cfg(test)]
 mod tests {
