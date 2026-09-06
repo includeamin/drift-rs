@@ -7,152 +7,140 @@ on:
       - 'CHANGELOG.md'
       - 'Cargo.toml'
       - 'src/lib.rs'
+  workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
-  release:
-    name: Create Release and Tag
+  check-release:
+    name: Check if Release is Needed
     runs-on: ubuntu-latest
     outputs:
-      new_version: ${{ steps.version.outputs.new_version }}
-      released: ${{ steps.version.outputs.released }}
+      should_release: ${{ steps.check.outputs.should_release }}
+      new_version: ${{ steps.check.outputs.new_version }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Install git-cliff
-        run: |
-          set -euo pipefail
-          curl -sSL https://github.com/orhun/git-cliff/releases/download/v0.14.0/git-cliff-0.14.0-x86_64-unknown-linux-gnu.tar.gz | tar xz -C /usr/local/bin/
-
-      - name: Determine version
-        id: version
+      - name: Check for conventional commits
+        id: check
         shell: bash
         run: |
           set -euo pipefail
           
-          # Get current version from Cargo.toml
+          # Get current version
           current_version=$(grep '^version' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
           echo "Current version: $current_version"
           
-          # Get the last tag matching v* pattern
+          # Check for commits since last tag
           last_tag=$(git describe --tags --match "v*" 2>/dev/null || echo "")
           
           if [ -z "$last_tag" ]; then
-            echo "No previous tag found, will check all commits"
             log_range="HEAD"
+            echo "No previous tags found"
           else
-            echo "Last tag: $last_tag"
             log_range="${last_tag}..HEAD"
+            echo "Commits since $last_tag"
           fi
           
-          # Check for breaking changes, features, or fixes in commit messages and bodies
+          # Get commit log
           commit_log=$(git rev-list --pretty=%B $log_range 2>/dev/null || echo "")
           
-          # Determine version bump based on conventional commits
-          has_breaking=false
-          has_feature=false
-          has_fix=false
+          # Check for conventional commits
+          has_breaking=$(echo "$commit_log" | grep -q "^BREAKING CHANGE:" && echo "true" || echo "false")
+          has_feat=$(echo "$commit_log" | grep -q "^feat" && echo "true" || echo "false")
+          has_fix=$(echo "$commit_log" | grep -q "^fix" && echo "true" || echo "false")
           
-          # Check for BREAKING CHANGE in commit body
-          if echo "$commit_log" | grep -q "^BREAKING CHANGE:"; then
-            has_breaking=true
-          fi
-          
-          # Check for feat: commits
-          if echo "$commit_log" | grep -q "^feat"; then
-            has_feature=true
-          fi
-          
-          # Check for fix: commits
-          if echo "$commit_log" | grep -q "^fix"; then
-            has_fix=true
-          fi
-          
-          if [ "$has_breaking" = true ]; then
-            # Major version bump
+          # Determine version bump
+          if [ "$has_breaking" = "true" ]; then
             major=$(echo "$current_version" | cut -d. -f1)
             new_version="$((major + 1)).0.0"
-          elif [ "$has_feature" = true ]; then
-            # Minor version bump
+          elif [ "$has_feat" = "true" ]; then
             major=$(echo "$current_version" | cut -d. -f1)
             minor=$(echo "$current_version" | cut -d. -f2)
             new_version="$major.$((minor + 1)).0"
-          elif [ "$has_fix" = true ]; then
-            # Patch version bump
+          elif [ "$has_fix" = "true" ]; then
             major=$(echo "$current_version" | cut -d. -f1)
             minor=$(echo "$current_version" | cut -d. -f2)
             patch=$(echo "$current_version" | cut -d. -f3)
             new_version="$major.$minor.$((patch + 1))"
           else
-            # No version bump needed
-            echo "No conventional commits found (feat:, fix:, or BREAKING CHANGE:)"
-            echo "released=false" >> "$GITHUB_OUTPUT"
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           
-          echo "New version: $new_version"
+          echo "should_release=true" >> "$GITHUB_OUTPUT"
           echo "new_version=$new_version" >> "$GITHUB_OUTPUT"
-          echo "released=true" >> "$GITHUB_OUTPUT"
+
+  release:
+    name: Create Release and Tag
+    needs: check-release
+    if: needs.check-release.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: dtolnay/rust-toolchain@stable
-        if: steps.version.outputs.released == 'true'
 
       - name: Update version in Cargo.toml
-        if: steps.version.outputs.released == 'true'
         shell: bash
         run: |
           set -euo pipefail
-          new_version="${{ steps.version.outputs.new_version }}"
+          new_version="${{ needs.check-release.outputs.new_version }}"
           sed -i "s/^version = .*/version = \"$new_version\"/" Cargo.toml
-          echo "Updated Cargo.toml to version $new_version"
 
       - name: Update version in lib.rs
-        if: steps.version.outputs.released == 'true'
         shell: bash
         run: |
           set -euo pipefail
-          new_version="${{ steps.version.outputs.new_version }}"
+          new_version="${{ needs.check-release.outputs.new_version }}"
           sed -i "s/pub const VERSION: &str = .*/pub const VERSION: \&str = \"$new_version\";/" src/lib.rs
-          echo "Updated src/lib.rs to version $new_version"
 
       - name: Generate changelog
-        if: steps.version.outputs.released == 'true'
         shell: bash
         run: |
           set -euo pipefail
-          git-cliff --config cliff.toml --output CHANGELOG.md v0.0.0..
+          new_version="${{ needs.check-release.outputs.new_version }}"
+          
+          # Create changelog entry
+          {
+            echo "# Changelog"
+            echo ""
+            echo "## [$new_version] - $(date +%Y-%m-%d)"
+            git log --pretty=format:"- %s" v0.0.0..HEAD 2>/dev/null | sort -u || echo "- Release $new_version"
+            echo ""
+          } > CHANGELOG.md.tmp
+          
+          if [ -f CHANGELOG.md ]; then
+            tail -n +2 CHANGELOG.md >> CHANGELOG.md.tmp 2>/dev/null || true
+          fi
+          mv CHANGELOG.md.tmp CHANGELOG.md
 
       - name: Verify build
-        if: steps.version.outputs.released == 'true'
+        shell: bash
         run: cargo build --locked
 
       - name: Create release commit and tag
-        if: steps.version.outputs.released == 'true'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          new_version="${{ steps.version.outputs.new_version }}"
+          new_version="${{ needs.check-release.outputs.new_version }}"
           tag="v$new_version"
           
-          # Configure git
           git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git config --local user.name "github-actions[bot]"
           
-          # Create release commit
-          git add Cargo.toml src/lib.rs CHANGELOG.md
-          git commit -m "chore(release): $tag" || true
+          if [ -n "$(git status --porcelain)" ]; then
+            git add Cargo.toml src/lib.rs CHANGELOG.md
+            git commit -m "chore(release): bump to $new_version"
+            git push origin main
+          fi
           
-          # Create annotated tag
-          git tag -a "$tag" -m "Release $tag" || true
-          
-          # Push changes and tag
-          git push origin main --force-with-lease
-          git push origin "$tag" || true
-          
-          echo "Created release commit and tag: $tag"
+          git tag -a "$tag" -m "Release $tag" || git tag -f -a "$tag" -m "Release $tag"
+          git push origin "$tag" --force || git push origin "$tag"
