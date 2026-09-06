@@ -4,6 +4,7 @@ mod model;
 mod patch;
 mod paths;
 mod pointer;
+mod scan;
 mod search;
 mod stream_io;
 pub mod streaming;
