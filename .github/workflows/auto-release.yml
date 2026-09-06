@@ -122,7 +122,7 @@ jobs:
 
       - name: Verify build
         shell: bash
-        run: cargo build --locked
+        run: cargo build
 
       - name: Create release commit and tag
         shell: bash
