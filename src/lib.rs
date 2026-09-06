@@ -18,7 +18,7 @@ pub use pointer::{escape_token, join_pointer, split_pointer, unescape_token};
 pub use search::{filter_operations, path_matches};
 pub use stream_io::diff_files;
 
-pub const VERSION: &str = "0.13.0";
+pub const VERSION: &str = "0.14.0";
 
 #[cfg(test)]
 mod tests {
