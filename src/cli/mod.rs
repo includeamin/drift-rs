@@ -41,8 +41,6 @@ struct DiffArgs {
     #[arg(long)]
     pretty: bool,
     #[arg(long)]
-    no_color: bool,
-    #[arg(long)]
     exit_code: bool,
     #[arg(long, value_enum)]
     format: Option<Format>,

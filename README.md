@@ -49,7 +49,7 @@ the file extension or selected with `--format`. Use `-` for stdin and
 
 `diff` supports `--stats`, `--pretty`, `--exit-code`, `--path`, `--field`,
 `--grep`, `--op`, and `--invert-match`. `paths` supports `--values`,
-`--containers`, `--include-root`, `--sort-keys`, and `--max-depth`.
+`--containers`, `--include-root`, `--sort-keys`, `--max-depth`, and `--json`.
 
 ## Library
 
@@ -99,14 +99,17 @@ let operations = diff_files(Path::new("old.json"), Path::new("new.json"))?;
 # Ok::<(), drift::DriftError>(())
 ```
 
-Streaming is skipped when it cannot work or would change behaviour:
+`diff_files` loads the whole document instead when:
 
-- Input read from stdin (`-`), which is not re-readable
-- Non-JSON formats (YAML, TOML, XML)
-- Roots that are neither an array nor an object, or a mismatched pair
-- Members under 1 MB, and members that are neither an array nor an object, which
-  are parsed individually instead
-- `--grep`, which matches against values in the old document and therefore
+- Both roots are not arrays, both are not objects, or the pair is mismatched
+- A member is under 1 MB, or is neither an array nor an object; these are parsed
+  individually, which is cheap at that size
+
+`drift diff` additionally loads when:
+
+- Input comes from stdin (`-`), which is not re-readable
+- The format is not JSON (YAML, TOML, XML)
+- `--grep` is used, since it matches against values in the old document and so
   needs it fully loaded
 
 ### Lower-level APIs
@@ -148,6 +151,7 @@ Rust 1.70 or newer is required:
 ```bash
 cargo test
 cargo build --release
+cargo bench
 ```
 
 The suite has 112 tests covering pointer operations, diff and patch behaviour,
