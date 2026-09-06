@@ -370,44 +370,37 @@ mod tests {
 
     #[test]
     fn filter_operations_by_path() {
-        let ops = vec![
-            Delta::new(Operation::Add, "/a/x"),
-            Delta::new(Operation::Add, "/b/y"),
-        ];
-        let filtered = filter_operations(&ops, None, &["/a/**".to_string()], &[], &[], &[], false).unwrap();
+        let ops = vec![Delta::new(Operation::Add, "/a/x"), Delta::new(Operation::Add, "/b/y")];
+        let filtered =
+            filter_operations(&ops, None, &["/a/**".to_string()], &[], &[], &[], false).unwrap();
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].path, "/a/x");
     }
 
     #[test]
     fn filter_operations_by_operation_type() {
-        let ops = vec![
-            Delta::new(Operation::Add, "/a"),
-            Delta::new(Operation::Remove, "/b"),
-        ];
-        let filtered = filter_operations(&ops, None, &[], &[], &[], &["add".to_string()], false).unwrap();
+        let ops = vec![Delta::new(Operation::Add, "/a"), Delta::new(Operation::Remove, "/b")];
+        let filtered =
+            filter_operations(&ops, None, &[], &[], &[], &["add".to_string()], false).unwrap();
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].op, Operation::Add);
     }
 
     #[test]
     fn filter_operations_invert() {
-        let ops = vec![
-            Delta::new(Operation::Add, "/a"),
-            Delta::new(Operation::Remove, "/b"),
-        ];
-        let filtered = filter_operations(&ops, None, &[], &[], &[], &["add".to_string()], true).unwrap();
+        let ops = vec![Delta::new(Operation::Add, "/a"), Delta::new(Operation::Remove, "/b")];
+        let filtered =
+            filter_operations(&ops, None, &[], &[], &[], &["add".to_string()], true).unwrap();
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].op, Operation::Remove);
     }
 
     #[test]
     fn filter_operations_by_field() {
-        let ops = vec![
-            Delta::new(Operation::Add, "/username"),
-            Delta::new(Operation::Add, "/password"),
-        ];
-        let filtered = filter_operations(&ops, None, &[], &["user.*".to_string()], &[], &[], false).unwrap();
+        let ops =
+            vec![Delta::new(Operation::Add, "/username"), Delta::new(Operation::Add, "/password")];
+        let filtered =
+            filter_operations(&ops, None, &[], &["user.*".to_string()], &[], &[], false).unwrap();
         assert_eq!(filtered.len(), 1);
     }
 
