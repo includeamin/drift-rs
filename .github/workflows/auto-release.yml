@@ -1,0 +1,158 @@
+name: Automated Release
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - 'CHANGELOG.md'
+      - 'Cargo.toml'
+      - 'src/lib.rs'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Create Release and Tag
+    runs-on: ubuntu-latest
+    outputs:
+      new_version: ${{ steps.version.outputs.new_version }}
+      released: ${{ steps.version.outputs.released }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install git-cliff
+        run: |
+          set -euo pipefail
+          curl -sSL https://github.com/orhun/git-cliff/releases/download/v0.14.0/git-cliff-0.14.0-x86_64-unknown-linux-gnu.tar.gz | tar xz -C /usr/local/bin/
+
+      - name: Determine version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          
+          # Get current version from Cargo.toml
+          current_version=$(grep '^version' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          echo "Current version: $current_version"
+          
+          # Get the last tag matching v* pattern
+          last_tag=$(git describe --tags --match "v*" 2>/dev/null || echo "")
+          
+          if [ -z "$last_tag" ]; then
+            echo "No previous tag found, will check all commits"
+            log_range="HEAD"
+          else
+            echo "Last tag: $last_tag"
+            log_range="${last_tag}..HEAD"
+          fi
+          
+          # Check for breaking changes, features, or fixes in commit messages and bodies
+          commit_log=$(git rev-list --pretty=%B $log_range 2>/dev/null || echo "")
+          
+          # Determine version bump based on conventional commits
+          has_breaking=false
+          has_feature=false
+          has_fix=false
+          
+          # Check for BREAKING CHANGE in commit body
+          if echo "$commit_log" | grep -q "^BREAKING CHANGE:"; then
+            has_breaking=true
+          fi
+          
+          # Check for feat: commits
+          if echo "$commit_log" | grep -q "^feat"; then
+            has_feature=true
+          fi
+          
+          # Check for fix: commits
+          if echo "$commit_log" | grep -q "^fix"; then
+            has_fix=true
+          fi
+          
+          if [ "$has_breaking" = true ]; then
+            # Major version bump
+            major=$(echo "$current_version" | cut -d. -f1)
+            new_version="$((major + 1)).0.0"
+          elif [ "$has_feature" = true ]; then
+            # Minor version bump
+            major=$(echo "$current_version" | cut -d. -f1)
+            minor=$(echo "$current_version" | cut -d. -f2)
+            new_version="$major.$((minor + 1)).0"
+          elif [ "$has_fix" = true ]; then
+            # Patch version bump
+            major=$(echo "$current_version" | cut -d. -f1)
+            minor=$(echo "$current_version" | cut -d. -f2)
+            patch=$(echo "$current_version" | cut -d. -f3)
+            new_version="$major.$minor.$((patch + 1))"
+          else
+            # No version bump needed
+            echo "No conventional commits found (feat:, fix:, or BREAKING CHANGE:)"
+            echo "released=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          
+          echo "New version: $new_version"
+          echo "new_version=$new_version" >> "$GITHUB_OUTPUT"
+          echo "released=true" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.version.outputs.released == 'true'
+
+      - name: Update version in Cargo.toml
+        if: steps.version.outputs.released == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          new_version="${{ steps.version.outputs.new_version }}"
+          sed -i "s/^version = .*/version = \"$new_version\"/" Cargo.toml
+          echo "Updated Cargo.toml to version $new_version"
+
+      - name: Update version in lib.rs
+        if: steps.version.outputs.released == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          new_version="${{ steps.version.outputs.new_version }}"
+          sed -i "s/pub const VERSION: &str = .*/pub const VERSION: \&str = \"$new_version\";/" src/lib.rs
+          echo "Updated src/lib.rs to version $new_version"
+
+      - name: Generate changelog
+        if: steps.version.outputs.released == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git-cliff --config cliff.toml --output CHANGELOG.md v0.0.0..
+
+      - name: Verify build
+        if: steps.version.outputs.released == 'true'
+        run: cargo build --locked
+
+      - name: Create release commit and tag
+        if: steps.version.outputs.released == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          new_version="${{ steps.version.outputs.new_version }}"
+          tag="v$new_version"
+          
+          # Configure git
+          git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          
+          # Create release commit
+          git add Cargo.toml src/lib.rs CHANGELOG.md
+          git commit -m "chore(release): $tag" || true
+          
+          # Create annotated tag
+          git tag -a "$tag" -m "Release $tag" || true
+          
+          # Push changes and tag
+          git push origin main --force-with-lease
+          git push origin "$tag" || true
+          
+          echo "Created release commit and tag: $tag"

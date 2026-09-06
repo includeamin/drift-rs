@@ -48,5 +48,5 @@ commit_parsers = [
 
 commit_preprocessors = [
   # Link issue and PR references back to GitHub.
-  { pattern = '\((\w+\s)?#([0-9]+)\)', replace = "([#${2}](https://github.com/includeamin/drift/issues/${2}))" },
+  { pattern = '\((\w+\s)?#([0-9]+)\)', replace = "([#${2}](https://github.com/includeamin/drift-rs/issues/${2}))" },
 ]
