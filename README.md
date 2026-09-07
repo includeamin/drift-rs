@@ -153,8 +153,3 @@ cargo test
 cargo build --release
 cargo bench
 ```
-
-The suite has 112 tests covering pointer operations, diff and patch behaviour,
-path listing, regex search and filtering, round-trip validation, unicode,
-JSON offset scanning, and streaming/in-memory equivalence. Coverage reports are
-generated on pull requests via [Codecov](https://codecov.io).
