@@ -100,7 +100,8 @@ fn remove(mut document: Value, path: &str) -> Result<Value, DriftError> {
     let (parent, segment) = parent_mut(&mut document, path)?;
     match parent {
         Value::Object(map) => {
-            map.remove(&segment).ok_or(DriftError::Missing(segment))?;
+            // `shift_remove`, not `remove`: the latter moves the last key into the gap.
+            map.shift_remove(&segment).ok_or(DriftError::Missing(segment))?;
         }
         Value::Array(items) => {
             items.remove(array_index(&segment, items.len(), false)?);
@@ -113,6 +114,45 @@ fn remove(mut document: Value, path: &str) -> Result<Value, DriftError> {
             })
         }
     }
+    Ok(document)
+}
+
+/// Parent pointer of `path` (everything before the last `/`).
+fn parent_pointer(path: &str) -> &str {
+    path.rsplit_once('/').map_or("", |(parent, _)| parent)
+}
+
+/// How many operations from the start of `operations` are removals of
+/// children of the same container.
+fn removal_run(operations: &[Delta]) -> usize {
+    let parent = parent_pointer(&operations[0].path);
+    operations
+        .iter()
+        .take_while(|op| op.op == Operation::Remove && parent_pointer(&op.path) == parent)
+        .count()
+}
+
+/// Applies a run of removals from one container.
+///
+/// Removing from an object one key at a time shifts every later key to keep
+/// the document order, which is quadratic over a large run. For an object the
+/// whole run is applied in a single pass instead, with the same errors as
+/// removing one at a time.
+fn remove_run(mut document: Value, run: &[Delta]) -> Result<Value, DriftError> {
+    let is_object = matches!(parent_mut(&mut document, &run[0].path)?.0, Value::Object(_));
+    if !is_object {
+        return run.iter().try_fold(document, |document, op| remove(document, &op.path));
+    }
+    let mut gone = std::collections::HashSet::new();
+    let (parent, _) = parent_mut(&mut document, &run[0].path)?;
+    let Value::Object(map) = parent else { unreachable!("checked above") };
+    for op in run {
+        let key = split_pointer(&op.path)?.pop().unwrap_or_default();
+        if !map.contains_key(&key) || !gone.insert(key.clone()) {
+            return Err(DriftError::Missing(key));
+        }
+    }
+    map.retain(|key, _| !gone.contains(key));
     Ok(document)
 }
 
@@ -170,7 +210,17 @@ fn replace(mut document: Value, path: &str, value: Value) -> Result<Value, Drift
 /// assert_eq!(result, new);
 /// ```
 pub fn patch(mut document: Value, operations: &[Delta]) -> Result<Value, DriftError> {
-    for operation in operations {
+    let mut index = 0;
+    while index < operations.len() {
+        let operation = &operations[index];
+        if operation.op == Operation::Remove {
+            let run = removal_run(&operations[index..]);
+            if run > 1 {
+                document = remove_run(document, &operations[index..index + run])?;
+                index += run;
+                continue;
+            }
+        }
         document = match operation.op {
             Operation::Add => {
                 add(document, &operation.path, operation.value.clone().unwrap_or(Value::Null))?
@@ -202,6 +252,7 @@ pub fn patch(mut document: Value, operations: &[Delta]) -> Result<Value, DriftEr
                 add(document, &operation.path, value)?
             }
         };
+        index += 1;
     }
     Ok(document)
 }

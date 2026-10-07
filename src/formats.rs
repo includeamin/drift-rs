@@ -469,4 +469,24 @@ mod tests {
         let text = dump(&listed, Format::Xml, false).unwrap();
         assert_eq!(parse_with(&text, Format::Xml, &options).unwrap().0, listed);
     }
+
+    #[test]
+    fn key_order_survives_a_round_trip() {
+        let cases = [
+            (Format::Json, "{\"zebra\": 1, \"apple\": 2, \"mango\": 3}"),
+            (Format::Yaml, "zebra: 1\napple: 2\nmango: 3\n"),
+            (Format::Toml, "zebra = 1\napple = 2\nmango = 3\n"),
+            (Format::Xml, "<r><zebra>1</zebra><apple>2</apple><mango>3</mango></r>"),
+        ];
+        for (format, text) in cases {
+            let value = parse(text, format).unwrap();
+            let out = dump(&value, format, false).unwrap();
+            let at = |name: &str| out.find(name).unwrap_or_else(|| panic!("{name} in {out}"));
+            assert!(
+                at("zebra") < at("apple") && at("apple") < at("mango"),
+                "{}: {out}",
+                format.as_str()
+            );
+        }
+    }
 }
