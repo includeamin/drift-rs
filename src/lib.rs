@@ -1,3 +1,41 @@
+//! Structural diff and patch for JSON, YAML, TOML and XML documents.
+//!
+//! [`diff`] compares two documents and returns the [RFC 6902] JSON Patch
+//! operations that turn one into the other; [`patch`] applies them. Documents
+//! of every format are handled as [`serde_json::Value`] trees, so a YAML file
+//! can be diffed against a JSON one. Parsing and writing the formats lives in
+//! [`formats`].
+//!
+//! ```
+//! use drift::{diff, patch};
+//! use serde_json::json;
+//!
+//! let old = json!({"name": "David", "tags": ["a"]});
+//! let new = json!({"name": "Alex", "tags": ["a", "b"]});
+//!
+//! let operations = diff(&new, &old);
+//! assert_eq!(operations.len(), 2);
+//! assert_eq!(patch(old, &operations)?, new);
+//! # Ok::<(), drift::DriftError>(())
+//! ```
+//!
+//! Arrays are compared by position unless [`DiffOptions::array_keys`] names a
+//! field that identifies items, see [`diff_with`]. Very large files can be
+//! diffed without loading them whole, see [`diff_files`] and [`streaming`].
+//!
+//! # Features
+//!
+//! - `yaml`, `toml`, `xml`: support for those formats in [`formats`] (JSON is
+//!   always available). Using a format whose feature is off returns an error
+//!   saying which feature to enable.
+//! - `cli`: the `drift` binary; implies all three formats.
+//!
+//! All are on by default. Library users who only need JSON can set
+//! `default-features = false`.
+//!
+//! [RFC 6902]: https://www.rfc-editor.org/rfc/rfc6902
+#![warn(missing_docs)]
+
 mod diff;
 mod error;
 pub mod formats;
@@ -19,6 +57,7 @@ pub use pointer::{escape_token, join_pointer, split_pointer, unescape_token};
 pub use search::{filter_operations, path_matches};
 pub use stream_io::diff_files;
 
+/// The version of this crate.
 pub const VERSION: &str = "0.15.0";
 
 #[cfg(test)]
