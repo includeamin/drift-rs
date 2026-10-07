@@ -126,6 +126,10 @@ fn xml_to_json(text: &str) -> Result<Value, Box<dyn std::error::Error>> {
     Ok(Value::Object([(root.tag_name().name().into(), element(root))].into_iter().collect()))
 }
 
+fn escape_xml(text: &str) -> String {
+    text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+}
+
 fn json_to_xml(value: &Value) -> Result<String, Box<dyn std::error::Error>> {
     fn element(tag: &str, value: &Value, output: &mut String) {
         output.push('<');
@@ -133,11 +137,11 @@ fn json_to_xml(value: &Value) -> Result<String, Box<dyn std::error::Error>> {
         if let Value::Object(map) = value {
             for (key, value) in map {
                 if let Some(attr) = key.strip_prefix('@') {
-                    output.push_str(&format!(
-                        " {}=\"{}\"",
-                        attr,
-                        value.to_string().replace('"', "&quot;")
-                    ));
+                    let text = match value {
+                        Value::String(text) => text.clone(),
+                        other => other.to_string(),
+                    };
+                    output.push_str(&format!(" {}=\"{}\"", attr, escape_xml(&text)));
                 }
             }
         }
@@ -149,7 +153,7 @@ fn json_to_xml(value: &Value) -> Result<String, Box<dyn std::error::Error>> {
                         continue;
                     }
                     if key == "#text" {
-                        output.push_str(value.as_str().unwrap_or(""));
+                        output.push_str(&escape_xml(value.as_str().unwrap_or("")));
                     } else if let Value::Array(values) = value {
                         for value in values {
                             element(key, value, output);
@@ -159,7 +163,7 @@ fn json_to_xml(value: &Value) -> Result<String, Box<dyn std::error::Error>> {
                     }
                 }
             }
-            Value::String(value) => output.push_str(value),
+            Value::String(value) => output.push_str(&escape_xml(value)),
             Value::Number(value) => output.push_str(&value.to_string()),
             Value::Bool(value) => output.push_str(&value.to_string()),
             Value::Null | Value::Array(_) => {}
@@ -178,4 +182,24 @@ fn json_to_xml(value: &Value) -> Result<String, Box<dyn std::error::Error>> {
     let mut output = String::new();
     element(tag, value, &mut output);
     Ok(output)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn xml_attributes_are_not_json_quoted() {
+        let xml = json_to_xml(&json!({"a": {"@id": "x", "#text": "hi"}})).unwrap();
+        assert_eq!(xml, "<a id=\"x\">hi</a>");
+    }
+
+    #[test]
+    fn xml_special_characters_are_escaped_and_round_trip() {
+        let value = json!({"a": {"@t": "\"q\" & <r>", "#text": "1 < 2 & 3"}});
+        let xml = json_to_xml(&value).unwrap();
+        assert!(!xml.contains("< 2"));
+        assert_eq!(xml_to_json(&xml).unwrap(), value);
+    }
 }
