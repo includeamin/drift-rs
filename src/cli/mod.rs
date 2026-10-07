@@ -46,6 +46,9 @@ struct DiffArgs {
     exit_code: bool,
     #[arg(long, value_enum)]
     format: Option<Format>,
+    /// XML: always read child elements as arrays, even a single one
+    #[arg(long)]
+    xml_arrays: bool,
     #[arg(long = "path")]
     paths: Vec<String>,
     #[arg(long = "field")]
@@ -71,6 +74,9 @@ struct PatchArgs {
     in_place: bool,
     #[arg(long, value_enum)]
     format: Option<Format>,
+    /// XML: always read child elements as arrays, even a single one
+    #[arg(long)]
+    xml_arrays: bool,
     #[command(flatten)]
     output: OutputArgs,
 }
@@ -91,6 +97,9 @@ struct PathsArgs {
     json: bool,
     #[arg(long, value_enum)]
     format: Option<Format>,
+    /// XML: always read child elements as arrays, even a single one
+    #[arg(long)]
+    xml_arrays: bool,
     #[command(flatten)]
     output: OutputArgs,
 }
@@ -100,6 +109,9 @@ struct CheckArgs {
     new: String,
     #[arg(long, value_enum)]
     format: Option<Format>,
+    /// XML: always read child elements as arrays, even a single one
+    #[arg(long)]
+    xml_arrays: bool,
     #[command(flatten)]
     output: OutputArgs,
 }
@@ -143,8 +155,8 @@ fn cmd_diff(args: DiffArgs) -> Result<i32, Box<dyn std::error::Error>> {
     let (diff_operations, old) = if delegate {
         (diff_files(Path::new(&args.old), Path::new(&args.new))?, None)
     } else {
-        let old = load(&args.old, format)?;
-        let new = load(&args.new, format)?;
+        let old = load(&args.old, format, args.xml_arrays)?.0;
+        let new = load(&args.new, format, args.xml_arrays)?.0;
         let options = DiffOptions { array_keys: args.array_keys.clone() };
         (diff_with(&new, &old, &options), Some(old))
     };
@@ -231,14 +243,15 @@ fn read_patch(path: &str) -> Result<Vec<Delta>, Box<dyn std::error::Error>> {
 
 fn cmd_patch(args: PatchArgs) -> Result<i32, Box<dyn std::error::Error>> {
     let format = resolve(args.format, &args.document);
-    let result = patch(load(&args.document, format)?, &read_patch(&args.patch)?)?;
+    let (document, hints) = load(&args.document, format, args.xml_arrays)?;
+    let result = patch(document, &read_patch(&args.patch)?)?;
     let destination = if args.in_place { Some(args.document) } else { args.output.output };
-    write_output(dump(&result, format, args.output.compact)?, &destination)?;
+    write_output(dump(&result, format, args.output.compact, &hints)?, &destination)?;
     Ok(0)
 }
 
 fn cmd_paths(args: PathsArgs) -> Result<i32, Box<dyn std::error::Error>> {
-    let document = load(&args.document, resolve(args.format, &args.document))?;
+    let document = load(&args.document, resolve(args.format, &args.document), args.xml_arrays)?.0;
     let paths = drift::list_json_paths(
         &document,
         args.include_root,
@@ -256,8 +269,8 @@ fn cmd_paths(args: PathsArgs) -> Result<i32, Box<dyn std::error::Error>> {
 
 fn cmd_check(args: CheckArgs) -> Result<i32, Box<dyn std::error::Error>> {
     let format = resolve(args.format, &args.old);
-    let old = load(&args.old, format)?;
-    let new = load(&args.new, format)?;
+    let old = load(&args.old, format, args.xml_arrays)?.0;
+    let new = load(&args.new, format, args.xml_arrays)?.0;
     let operations = diff(&new, &old);
     let ok = patch(old, &operations)? == new;
     write_output(

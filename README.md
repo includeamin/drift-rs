@@ -111,12 +111,16 @@ Documents are converted to a JSON value tree, which loses a few things:
 
 - **XML:** attributes become `@name` keys and text becomes `#text`. Namespace
   prefixes and `xmlns` declarations are kept. All text of an element is joined,
-  so its position relative to child elements is lost. One child element is an
-  object and repeated children are an array, so a list with a single entry
-  reads back as a scalar.
-- **TOML:** datetimes become strings (so patching a TOML file writes them back
-  as quoted strings), and `nan`/`inf`/`-inf` become the strings `"nan"`,
-  `"inf"` and `"-inf"` since JSON cannot represent them.
+  so its position relative to child elements is lost. A single child element
+  reads as an object and repeated children as an array, so a one-entry list
+  reads back as a scalar. Pass `--xml-arrays` (or
+  `ParseOptions { xml_arrays: true }`) to always read children as arrays, which
+  keeps the shape stable across versions of a document.
+- **TOML:** datetimes and `nan`/`inf`/`-inf` become JSON strings, since JSON has
+  neither. `drift patch` (and `formats::parse_with` / `dump_with`) remembers
+  where they were and writes them back as datetimes and floats; a quoted string
+  that merely looks like a date stays a string. Paths into arrays are matched by
+  index, so a patch that shifts an array of datetimes can lose that.
 
 ## Large files
 

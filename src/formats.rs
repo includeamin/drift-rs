@@ -3,8 +3,10 @@
 //! Every format is converted to and from a [`serde_json::Value`], which is what
 //! [`crate::diff`] and [`crate::patch`] operate on.
 
+use crate::join_pointer;
 use crate::DriftError;
 use serde_json::Value;
+use std::collections::BTreeSet;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Format {
@@ -63,37 +65,82 @@ impl Format {
     }
 }
 
+/// Reading options.
+#[derive(Debug, Clone, Default)]
+pub struct ParseOptions {
+    /// XML only: always represent child elements as arrays, even a single one,
+    /// so a list with one entry keeps its shape instead of reading as a scalar.
+    pub xml_arrays: bool,
+}
+
+/// What the source document knew that JSON cannot express.
+///
+/// TOML datetimes and `nan`/`inf` floats become JSON strings, so a document
+/// read, patched and written back would otherwise turn them into quoted
+/// strings. The paths where they were found are kept here, and [`dump_with`]
+/// uses them to write those values back as their original type.
+#[derive(Debug, Clone, Default)]
+pub struct Hints {
+    datetimes: BTreeSet<String>,
+    special_floats: BTreeSet<String>,
+}
+
 pub fn parse(text: &str, format: Format) -> Result<Value, DriftError> {
+    parse_with(text, format, &ParseOptions::default()).map(|(value, _)| value)
+}
+
+/// Like [`parse`], also returning [`Hints`] for writing the document back.
+pub fn parse_with(
+    text: &str,
+    format: Format,
+    options: &ParseOptions,
+) -> Result<(Value, Hints), DriftError> {
     let error = |e: &dyn std::fmt::Display| DriftError::Parse(format!("{}: {e}", format.as_str()));
-    match format {
-        Format::Json => serde_json::from_str(text).map_err(|e| error(&e)),
-        Format::Yaml => serde_yaml::from_str(text).map_err(|e| error(&e)),
+    let mut hints = Hints::default();
+    let value = match format {
+        Format::Json => serde_json::from_str(text).map_err(|e| error(&e))?,
+        Format::Yaml => serde_yaml::from_str(text).map_err(|e| error(&e))?,
         Format::Toml => {
-            toml::from_str(text).map(toml_to_json).map_err(|e: toml::de::Error| error(&e))
+            let table: toml::Value = toml::from_str(text).map_err(|e| error(&e))?;
+            toml_to_json(table, "", &mut hints)
         }
-        Format::Xml => xml_to_json(text).map_err(|e| error(&*e)),
-    }
+        Format::Xml => xml_to_json(text, options).map_err(|e| error(&*e))?,
+    };
+    Ok((value, hints))
 }
 
 pub fn dump(value: &Value, format: Format, compact: bool) -> Result<String, DriftError> {
+    dump_with(value, format, compact, &Hints::default())
+}
+
+/// Like [`dump`], restoring the types recorded in `hints`.
+pub fn dump_with(
+    value: &Value,
+    format: Format,
+    compact: bool,
+    hints: &Hints,
+) -> Result<String, DriftError> {
     let error = |e: &dyn std::fmt::Display| DriftError::Parse(format!("{}: {e}", format.as_str()));
     match format {
         Format::Json if compact => serde_json::to_string(value).map_err(|e| error(&e)),
         Format::Json => serde_json::to_string_pretty(value).map_err(|e| error(&e)),
         Format::Yaml => serde_yaml::to_string(value).map_err(|e| error(&e)),
-        Format::Toml => toml::to_string_pretty(&json_to_toml(value).map_err(|e| error(&*e))?)
-            .map_err(|e| error(&e)),
+        Format::Toml => {
+            toml::to_string_pretty(&json_to_toml(value, "", hints).map_err(|e| error(&*e))?)
+                .map_err(|e| error(&e))
+        }
         Format::Xml => json_to_xml(value).map_err(|e| error(&*e)),
     }
 }
 
-fn toml_to_json(value: toml::Value) -> Value {
+fn toml_to_json(value: toml::Value, path: &str, hints: &mut Hints) -> Value {
     match value {
         toml::Value::String(v) => Value::String(v),
         toml::Value::Integer(v) => Value::Number(v.into()),
         // JSON has no NaN or infinity; keep them as strings rather than losing them.
         toml::Value::Float(v) => serde_json::Number::from_f64(v).map_or_else(
             || {
+                hints.special_floats.insert(path.into());
                 Value::String(
                     if v.is_nan() {
                         "nan"
@@ -108,25 +155,48 @@ fn toml_to_json(value: toml::Value) -> Value {
             Value::Number,
         ),
         toml::Value::Boolean(v) => Value::Bool(v),
-        toml::Value::Datetime(v) => Value::String(v.to_string()),
-        toml::Value::Array(v) => Value::Array(v.into_iter().map(toml_to_json).collect()),
-        toml::Value::Table(v) => {
-            Value::Object(v.into_iter().map(|(k, v)| (k, toml_to_json(v))).collect())
+        toml::Value::Datetime(v) => {
+            hints.datetimes.insert(path.into());
+            Value::String(v.to_string())
         }
+        toml::Value::Array(v) => Value::Array(
+            v.into_iter()
+                .enumerate()
+                .map(|(i, item)| toml_to_json(item, &join_pointer(path, &i.to_string()), hints))
+                .collect(),
+        ),
+        toml::Value::Table(v) => Value::Object(
+            v.into_iter()
+                .map(|(k, item)| {
+                    let child = join_pointer(path, &k);
+                    (k, toml_to_json(item, &child, hints))
+                })
+                .collect(),
+        ),
     }
 }
 
-fn json_to_toml(value: &Value) -> Result<toml::Value, Box<dyn std::error::Error>> {
+fn json_to_toml(
+    value: &Value,
+    path: &str,
+    hints: &Hints,
+) -> Result<toml::Value, Box<dyn std::error::Error>> {
     Ok(match value {
         Value::Object(map) => toml::Value::Table(
             map.iter()
-                .map(|(key, value)| Ok((key.clone(), json_to_toml(value)?)))
+                .map(|(key, value)| {
+                    Ok((key.clone(), json_to_toml(value, &join_pointer(path, key), hints)?))
+                })
                 .collect::<Result<_, Box<dyn std::error::Error>>>()?,
         ),
-        Value::Array(values) => {
-            toml::Value::Array(values.iter().map(json_to_toml).collect::<Result<_, _>>()?)
-        }
-        Value::String(value) => toml::Value::String(value.clone()),
+        Value::Array(values) => toml::Value::Array(
+            values
+                .iter()
+                .enumerate()
+                .map(|(i, value)| json_to_toml(value, &join_pointer(path, &i.to_string()), hints))
+                .collect::<Result<_, _>>()?,
+        ),
+        Value::String(text) => restore_toml_type(text, path, hints),
         Value::Number(value) => value
             .as_i64()
             .map(toml::Value::Integer)
@@ -137,7 +207,26 @@ fn json_to_toml(value: &Value) -> Result<toml::Value, Box<dyn std::error::Error>
     })
 }
 
-fn xml_to_json(text: &str) -> Result<Value, Box<dyn std::error::Error>> {
+/// A string at a path that held a datetime or `nan`/`inf` in the source goes
+/// back to that type, if it still reads as one. Anything else stays a string.
+fn restore_toml_type(text: &str, path: &str, hints: &Hints) -> toml::Value {
+    if hints.datetimes.contains(path) {
+        if let Ok(datetime) = text.parse::<toml::value::Datetime>() {
+            return toml::Value::Datetime(datetime);
+        }
+    }
+    if hints.special_floats.contains(path) {
+        match text {
+            "nan" => return toml::Value::Float(f64::NAN),
+            "inf" => return toml::Value::Float(f64::INFINITY),
+            "-inf" => return toml::Value::Float(f64::NEG_INFINITY),
+            _ => {}
+        }
+    }
+    toml::Value::String(text.into())
+}
+
+fn xml_to_json(text: &str, options: &ParseOptions) -> Result<Value, Box<dyn std::error::Error>> {
     let doc = roxmltree::Document::parse(text)?;
     /// Name as written in the source, with its namespace prefix.
     fn qualified(node: roxmltree::Node, local: &str, uri: Option<&str>) -> String {
@@ -146,7 +235,7 @@ fn xml_to_json(text: &str) -> Result<Value, Box<dyn std::error::Error>> {
             None => local.to_string(),
         }
     }
-    fn element(node: roxmltree::Node) -> Value {
+    fn element(node: roxmltree::Node, always_array: bool) -> Value {
         let mut object = serde_json::Map::new();
         // Namespace declarations made on this element (not inherited ones).
         for ns in node.namespaces() {
@@ -166,10 +255,15 @@ fn xml_to_json(text: &str) -> Result<Value, Box<dyn std::error::Error>> {
             object.insert(format!("@{name}"), Value::String(attr.value().into()));
         }
         for child in node.children().filter(|node| node.is_element()) {
-            let value = element(child);
+            let value = element(child, always_array);
             let tag = child.tag_name();
             let key = qualified(child, tag.name(), tag.namespace());
-            if let Some(existing) = object.get_mut(&key) {
+            if always_array {
+                match object.entry(key).or_insert_with(|| Value::Array(Vec::new())) {
+                    Value::Array(values) => values.push(value),
+                    _ => unreachable!("with always_array every child entry is an array"),
+                }
+            } else if let Some(existing) = object.get_mut(&key) {
                 if let Value::Array(values) = existing {
                     values.push(value);
                 } else {
@@ -200,7 +294,7 @@ fn xml_to_json(text: &str) -> Result<Value, Box<dyn std::error::Error>> {
     let root = doc.root_element();
     let tag = root.tag_name();
     let name = qualified(root, tag.name(), tag.namespace());
-    Ok(Value::Object([(name, element(root))].into_iter().collect()))
+    Ok(Value::Object([(name, element(root, options.xml_arrays))].into_iter().collect()))
 }
 
 fn escape_xml(text: &str) -> String {
@@ -300,26 +394,26 @@ mod tests {
         let value = json!({"a": {"@t": "\"q\" & <r>", "#text": "1 < 2 & 3"}});
         let xml = json_to_xml(&value).unwrap();
         assert!(!xml.contains("< 2"));
-        assert_eq!(xml_to_json(&xml).unwrap(), value);
+        assert_eq!(parse(&xml, Format::Xml).unwrap(), value);
     }
 
     #[test]
     fn xml_namespaces_are_preserved() {
         let xml =
             r#"<a:root xmlns:a="urn:a" xmlns="urn:d"><a:item a:id="1">x</a:item><plain/></a:root>"#;
-        let value = xml_to_json(xml).unwrap();
+        let value = parse(xml, Format::Xml).unwrap();
         let root = &value["a:root"];
         assert_eq!(root["@xmlns:a"], "urn:a");
         assert_eq!(root["@xmlns"], "urn:d");
         assert_eq!(root["a:item"]["@a:id"], "1");
         assert_eq!(root["a:item"]["#text"], "x");
         // Round trip keeps the document equivalent.
-        assert_eq!(xml_to_json(&json_to_xml(&value).unwrap()).unwrap(), value);
+        assert_eq!(parse(&json_to_xml(&value).unwrap(), Format::Xml).unwrap(), value);
     }
 
     #[test]
     fn xml_mixed_content_keeps_all_text() {
-        let value = xml_to_json("<p>Hello <b>big</b> world</p>").unwrap();
+        let value = parse("<p>Hello <b>big</b> world</p>", Format::Xml).unwrap();
         assert_eq!(value["p"]["#text"], "Hello world");
         assert_eq!(value["p"]["b"], "big");
     }
@@ -335,7 +429,44 @@ mod tests {
 
     #[test]
     fn xml_lang_attribute_keeps_its_prefix() {
-        let value = xml_to_json(r#"<a xml:lang="en">x</a>"#).unwrap();
+        let value = parse(r#"<a xml:lang="en">x</a>"#, Format::Xml).unwrap();
         assert_eq!(value["a"]["@xml:lang"], "en");
+    }
+
+    #[test]
+    fn toml_datetimes_and_special_floats_survive_a_patch() {
+        let text = "when = 2024-05-06T07:08:09Z\nday = 2024-05-06\nratio = nan\nname = \"x\"\n";
+        let (value, hints) = parse_with(text, Format::Toml, &ParseOptions::default()).unwrap();
+        let mut value = value;
+        value["name"] = "y".into();
+        value["day"] = "2025-01-02".into();
+        let out = dump_with(&value, Format::Toml, false, &hints).unwrap();
+        let reread: toml::Value = toml::from_str(&out).unwrap();
+        assert!(matches!(reread["when"], toml::Value::Datetime(_)), "{out}");
+        assert_eq!(reread["day"].as_datetime().unwrap().to_string(), "2025-01-02");
+        assert!(matches!(reread["day"], toml::Value::Datetime(_)), "{out}");
+        assert!(reread["ratio"].as_float().is_some_and(f64::is_nan), "{out}");
+        assert_eq!(reread["name"].as_str(), Some("y"));
+    }
+
+    #[test]
+    fn quoted_strings_that_look_like_dates_stay_strings() {
+        let (value, hints) =
+            parse_with("a = \"2024-05-06\"\n", Format::Toml, &ParseOptions::default()).unwrap();
+        let out = dump_with(&value, Format::Toml, false, &hints).unwrap();
+        assert!(toml::from_str::<toml::Value>(&out).unwrap()["a"].is_str(), "{out}");
+    }
+
+    #[test]
+    fn xml_arrays_option_keeps_single_children_as_lists() {
+        let xml = "<r><item>1</item></r>";
+        let default = parse(xml, Format::Xml).unwrap();
+        assert_eq!(default["r"]["item"], "1");
+        let options = ParseOptions { xml_arrays: true };
+        let (listed, _) = parse_with(xml, Format::Xml, &options).unwrap();
+        assert_eq!(listed["r"]["item"], serde_json::json!(["1"]));
+        // The list shape round-trips.
+        let text = dump(&listed, Format::Xml, false).unwrap();
+        assert_eq!(parse_with(&text, Format::Xml, &options).unwrap().0, listed);
     }
 }

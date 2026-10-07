@@ -32,7 +32,11 @@ pub fn resolve(explicit: Option<Format>, path: &str) -> formats::Format {
         .unwrap_or(formats::Format::Json)
 }
 
-pub fn load(path: &str, format: formats::Format) -> Result<Value, Box<dyn std::error::Error>> {
+pub fn load(
+    path: &str,
+    format: formats::Format,
+    xml_arrays: bool,
+) -> Result<(Value, formats::Hints), Box<dyn std::error::Error>> {
     let text = if path == "-" {
         let mut text = String::new();
         io::stdin().read_to_string(&mut text)?;
@@ -40,13 +44,14 @@ pub fn load(path: &str, format: formats::Format) -> Result<Value, Box<dyn std::e
     } else {
         fs::read_to_string(path)?
     };
-    Ok(formats::parse(&text, format)?)
+    Ok(formats::parse_with(&text, format, &formats::ParseOptions { xml_arrays })?)
 }
 
 pub fn dump(
     value: &Value,
     format: formats::Format,
     compact: bool,
+    hints: &formats::Hints,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    Ok(formats::dump(value, format, compact)?)
+    Ok(formats::dump_with(value, format, compact, hints)?)
 }
