@@ -1,5 +1,6 @@
 mod diff;
 mod error;
+pub mod formats;
 mod model;
 mod patch;
 mod paths;
@@ -18,7 +19,7 @@ pub use pointer::{escape_token, join_pointer, split_pointer, unescape_token};
 pub use search::{filter_operations, path_matches};
 pub use stream_io::diff_files;
 
-pub const VERSION: &str = "0.14.1";
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[cfg(test)]
 mod tests {
