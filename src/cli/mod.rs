@@ -2,7 +2,9 @@ pub mod formats;
 
 use self::formats::{dump, load, resolve, Format};
 use clap::{Args, Parser, Subcommand};
-use drift::{diff, diff_files, filter_operations, patch, Delta, Operation, VERSION};
+use drift::{
+    diff, diff_files, diff_with, filter_operations, patch, Delta, DiffOptions, Operation, VERSION,
+};
 use serde_json::Value;
 use std::{
     fs,
@@ -54,6 +56,10 @@ struct DiffArgs {
     operations: Vec<String>,
     #[arg(long)]
     invert_match: bool,
+    /// Match array items by this field (repeatable, first usable one wins)
+    /// instead of by position. Loads both documents into memory.
+    #[arg(long = "array-key")]
+    array_keys: Vec<String>,
     #[command(flatten)]
     output: OutputArgs,
 }
@@ -131,14 +137,16 @@ fn cmd_diff(args: DiffArgs) -> Result<i32, Box<dyn std::error::Error>> {
     let delegate = matches!(format, drift::formats::Format::Json)
         && args.old != "-"
         && args.new != "-"
-        && args.values.is_empty();
+        && args.values.is_empty()
+        && args.array_keys.is_empty();
 
     let (diff_operations, old) = if delegate {
         (diff_files(Path::new(&args.old), Path::new(&args.new))?, None)
     } else {
         let old = load(&args.old, format)?;
         let new = load(&args.new, format)?;
-        (diff(&new, &old), Some(old))
+        let options = DiffOptions { array_keys: args.array_keys.clone() };
+        (diff_with(&new, &old, &options), Some(old))
     };
 
     let operations = filter_operations(

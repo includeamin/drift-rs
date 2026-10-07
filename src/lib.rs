@@ -10,7 +10,7 @@ mod search;
 mod stream_io;
 pub mod streaming;
 
-pub use diff::diff;
+pub use diff::{diff, diff_with, match_array_items, DiffOptions};
 pub use error::DriftError;
 pub use model::{Delta, Operation};
 pub use patch::patch;
