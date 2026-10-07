@@ -59,6 +59,8 @@ for (const side of ["old", "new"]) {
   });
 }
 
+$("array-keys").addEventListener("input", () => scheduleLive());
+
 const scheduleLive = debounce(() => { if ($("live").checked) compute(); }, 350);
 
 const select = $("example");
@@ -68,6 +70,7 @@ select.addEventListener("change", () => {
   if (!ex) return;
   setText("old", ex.old.text, ex.old.hint);
   setText("new", ex.new.text, ex.new.hint);
+  $("array-keys").value = ex.keys ?? "";
   compute();
 });
 
@@ -89,7 +92,7 @@ function compute() {
   const started = performance.now();
   let result;
   try {
-    result = JSON.parse(run_diff(oldText, newText, hintFor("old"), hintFor("new")));
+    result = JSON.parse(run_diff(oldText, newText, hintFor("old"), hintFor("new"), $("array-keys").value));
   } catch (err) {
     showError(`Unexpected failure: ${err}`);
     return;
@@ -188,7 +191,9 @@ function valueLines(value, key, depth, comma) {
 
 function keyLabel(node, parentContainer) {
   if (node.key === null) return null;
-  return parentContainer === "array" ? `[${node.key}]` : JSON.stringify(node.key);
+  if (parentContainer !== "array") return JSON.stringify(node.key);
+  // Key-matched items that changed position carry where they came from.
+  return node.moved_from === undefined ? `[${node.key}]` : `[${node.key}] ↕from ${node.moved_from}`;
 }
 
 function cell(text, status, sign) {
@@ -365,7 +370,8 @@ async function boot() {
     await init({ module_or_path: bytes });
     $("version").textContent = `v${version()}`;
     $("loading").hidden = true;
-    select.value = "0";
+    const wanted = new URLSearchParams(location.search).get("example");
+    select.value = wanted !== null && EXAMPLES[Number(wanted)] ? wanted : "0";
     select.dispatchEvent(new Event("change"));
   } catch (err) {
     $("loading").hidden = true;

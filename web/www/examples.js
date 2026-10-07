@@ -96,6 +96,27 @@ fast = []
 `, hint: "new.xml" },
   },
   {
+    name: "JSON · array reorder (use Array key: id)",
+    keys: "id",
+    old: { text: `{
+  "users": [
+    { "id": 1, "name": "Ada", "role": "admin" },
+    { "id": 2, "name": "Grace", "role": "editor" },
+    { "id": 3, "name": "Linus", "role": "viewer" }
+  ]
+}
+`, hint: "old.json" },
+    new: { text: `{
+  "users": [
+    { "id": 0, "name": "Alan", "role": "viewer" },
+    { "id": 3, "name": "Linus", "role": "editor" },
+    { "id": 1, "name": "Ada", "role": "admin" },
+    { "id": 2, "name": "Grace", "role": "editor" }
+  ]
+}
+`, hint: "new.json" },
+  },
+  {
     name: "Cross-format · YAML vs JSON",
     old: { text: `server:
   host: localhost

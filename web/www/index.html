@@ -63,6 +63,9 @@
     <button class="btn" id="swap">Swap</button>
     <button class="btn" id="clear">Clear</button>
     <label class="check"><input type="checkbox" id="live" checked> Live</label>
+    <label class="check" title="Match array items by these fields (comma-separated) instead of by position">Array key
+      <input type="text" id="array-keys" class="keys" placeholder="e.g. id, name" spellcheck="false" autocomplete="off">
+    </label>
   </div>
 
   <div id="error" class="error" role="alert" hidden></div>
@@ -85,7 +88,7 @@
         </div>
         <label class="check"><input type="checkbox" id="show-same"> Expand unchanged</label>
       </div>
-      <p class="note" id="array-note" hidden>Heads up: drift compares arrays by position, so inserting an item near the start of an array shows up as a run of changes after it.</p>
+      <p class="note" id="array-note" hidden>Heads up: drift compares arrays by position, so inserting an item near the start of an array shows up as a run of changes after it. Set an <strong>Array key</strong> (for example <code>id</code>) to match items by field instead.</p>
       <div class="sbs-head"><span>Old</span><span>New</span></div>
       <div class="sbs" id="sbs" role="table" aria-label="Side by side diff"></div>
     </div>
