@@ -128,7 +128,7 @@ fn cmd_diff(args: DiffArgs) -> Result<i32, Box<dyn std::error::Error>> {
     let format = resolve(args.format, &args.old);
 
     // `--grep` inspects old values, so it needs the whole old document in memory.
-    let delegate = matches!(format, Format::Json)
+    let delegate = matches!(format, drift::formats::Format::Json)
         && args.old != "-"
         && args.new != "-"
         && args.values.is_empty();

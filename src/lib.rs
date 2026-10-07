@@ -1,5 +1,6 @@
 mod diff;
 mod error;
+pub mod formats;
 mod model;
 mod patch;
 mod paths;
