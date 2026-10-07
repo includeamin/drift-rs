@@ -149,6 +149,11 @@ Peak memory for the in-memory path runs 15-27x the file size, because a
 `serde_json::Value` tree is much larger than its serialized form. The streaming
 path stays flat regardless of input size.
 
+The table was measured before objects kept their key order. Preserving order
+costs the in-memory path about a third more memory (a 36 MB array of 400k
+objects: 857 MB before, 1,157 MB now) at about the same speed; streaming is
+unchanged.
+
 ```rust
 use drift::diff_files;
 use std::path::Path;

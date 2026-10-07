@@ -104,6 +104,78 @@ mod tests {
         assert_eq!(join_pointer("/x", "a/b~c"), "/x/a~1b~0c");
     }
 
+    // ===== Key order =====
+    fn keys(value: &serde_json::Value) -> Vec<&str> {
+        value.as_object().unwrap().keys().map(String::as_str).collect()
+    }
+
+    #[test]
+    fn patch_remove_keeps_the_order_of_the_other_keys() {
+        let doc = json!({"c": 1, "a": 2, "d": 3, "b": 4});
+        let ops = [Delta::new(Operation::Remove, "/a")];
+        assert_eq!(keys(&patch(doc, &ops).unwrap()), ["c", "d", "b"]);
+    }
+
+    #[test]
+    fn a_run_of_removals_keeps_order_and_matches_one_at_a_time() {
+        let doc = json!({"a": 1, "b": 2, "c": 3, "d": 4, "e": 5, "n": {"x": 1, "y": 2, "z": 3}});
+        let ops = [
+            Delta::new(Operation::Remove, "/b"),
+            Delta::new(Operation::Remove, "/d"),
+            Delta::new(Operation::Remove, "/n/y"),
+            Delta::new(Operation::Remove, "/n/x"),
+            Delta::new(Operation::Remove, "/e"),
+        ];
+        let batched = patch(doc.clone(), &ops).unwrap();
+        let sequential = ops.iter().fold(doc, |d, op| patch(d, std::slice::from_ref(op)).unwrap());
+        assert_eq!(batched, sequential);
+        assert_eq!(keys(&batched), ["a", "c", "n"]);
+        assert_eq!(keys(&batched["n"]), ["z"]);
+    }
+
+    #[test]
+    fn a_run_of_removals_still_rejects_missing_and_repeated_keys() {
+        let doc = json!({"a": 1, "b": 2});
+        for paths in [["/a", "/zzz"], ["/a", "/a"]] {
+            let ops: Vec<_> = paths.iter().map(|p| Delta::new(Operation::Remove, *p)).collect();
+            assert!(matches!(patch(doc.clone(), &ops), Err(DriftError::Missing(_))), "{paths:?}");
+        }
+    }
+
+    #[test]
+    fn a_run_of_removals_on_an_array_or_scalar_parent_errors_like_before() {
+        let doc = json!({"xs": [1, 2, 3], "s": 5});
+        let two =
+            |a: &str, b: &str| [Delta::new(Operation::Remove, a), Delta::new(Operation::Remove, b)];
+        assert_eq!(patch(doc.clone(), &two("/xs/2", "/xs/1")).unwrap()["xs"], json!([1]));
+        assert!(patch(doc, &two("/s/a", "/s/b")).is_err());
+    }
+
+    #[test]
+    fn patch_add_appends_and_replace_keeps_position() {
+        let doc = json!({"c": 1, "a": 2});
+        let ops = [
+            Delta::with_value(Operation::Add, "/b", json!(3)),
+            Delta::with_value(Operation::Replace, "/c", json!(9)),
+        ];
+        assert_eq!(keys(&patch(doc, &ops).unwrap()), ["c", "a", "b"]);
+    }
+
+    #[test]
+    fn paths_follow_document_order_unless_sorted() {
+        let doc = json!({"b": 1, "a": {"y": 1, "x": 2}});
+        assert_eq!(list_json_paths(&doc, false, false, false, None), ["/b", "/a/y", "/a/x"]);
+        assert_eq!(list_json_paths(&doc, false, false, true, None), ["/a/x", "/a/y", "/b"]);
+    }
+
+    #[test]
+    fn diff_operations_stay_sorted_by_key() {
+        let old = json!({"b": 1, "a": 1});
+        let new = json!({"b": 2, "a": 2});
+        let paths: Vec<_> = diff(&new, &old).into_iter().map(|d| d.path).collect();
+        assert_eq!(paths, ["/a", "/b"]);
+    }
+
     // ===== Diff Tests =====
     #[test]
     fn nested_diff_round_trips() {
