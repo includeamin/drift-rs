@@ -91,7 +91,22 @@ fn toml_to_json(value: toml::Value) -> Value {
     match value {
         toml::Value::String(v) => Value::String(v),
         toml::Value::Integer(v) => Value::Number(v.into()),
-        toml::Value::Float(v) => serde_json::Number::from_f64(v).map_or(Value::Null, Value::Number),
+        // JSON has no NaN or infinity; keep them as strings rather than losing them.
+        toml::Value::Float(v) => serde_json::Number::from_f64(v).map_or_else(
+            || {
+                Value::String(
+                    if v.is_nan() {
+                        "nan"
+                    } else if v > 0.0 {
+                        "inf"
+                    } else {
+                        "-inf"
+                    }
+                    .into(),
+                )
+            },
+            Value::Number,
+        ),
         toml::Value::Boolean(v) => Value::Bool(v),
         toml::Value::Datetime(v) => Value::String(v.to_string()),
         toml::Value::Array(v) => Value::Array(v.into_iter().map(toml_to_json).collect()),
@@ -124,14 +139,36 @@ fn json_to_toml(value: &Value) -> Result<toml::Value, Box<dyn std::error::Error>
 
 fn xml_to_json(text: &str) -> Result<Value, Box<dyn std::error::Error>> {
     let doc = roxmltree::Document::parse(text)?;
+    /// Name as written in the source, with its namespace prefix.
+    fn qualified(node: roxmltree::Node, local: &str, uri: Option<&str>) -> String {
+        match uri.and_then(|uri| node.lookup_prefix(uri)).filter(|prefix| !prefix.is_empty()) {
+            Some(prefix) => format!("{prefix}:{local}"),
+            None => local.to_string(),
+        }
+    }
     fn element(node: roxmltree::Node) -> Value {
         let mut object = serde_json::Map::new();
+        // Namespace declarations made on this element (not inherited ones).
+        for ns in node.namespaces() {
+            let inherited = node.parent_element().is_some_and(|parent| {
+                parent.namespaces().any(|p| p.name() == ns.name() && p.uri() == ns.uri())
+            });
+            if !inherited {
+                let key = match ns.name() {
+                    Some(prefix) => format!("@xmlns:{prefix}"),
+                    None => "@xmlns".to_string(),
+                };
+                object.insert(key, Value::String(ns.uri().into()));
+            }
+        }
         for attr in node.attributes() {
-            object.insert(format!("@{}", attr.name()), Value::String(attr.value().into()));
+            let name = qualified(node, attr.name(), attr.namespace());
+            object.insert(format!("@{name}"), Value::String(attr.value().into()));
         }
         for child in node.children().filter(|node| node.is_element()) {
             let value = element(child);
-            let key = child.tag_name().name().to_string();
+            let tag = child.tag_name();
+            let key = qualified(child, tag.name(), tag.namespace());
             if let Some(existing) = object.get_mut(&key) {
                 if let Value::Array(values) = existing {
                     values.push(value);
@@ -142,18 +179,28 @@ fn xml_to_json(text: &str) -> Result<Value, Box<dyn std::error::Error>> {
                 object.insert(key, value);
             }
         }
-        let text = node.text().unwrap_or("").trim();
+        // All text nodes, joined: ordering relative to child elements is lost.
+        let text = node
+            .children()
+            .filter(|child| child.is_text())
+            .filter_map(|child| child.text())
+            .map(str::trim)
+            .filter(|piece| !piece.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
         if object.is_empty() {
-            Value::String(text.into())
+            Value::String(text)
         } else {
             if !text.is_empty() {
-                object.insert("#text".into(), Value::String(text.into()));
+                object.insert("#text".into(), Value::String(text));
             }
             Value::Object(object)
         }
     }
     let root = doc.root_element();
-    Ok(Value::Object([(root.tag_name().name().into(), element(root))].into_iter().collect()))
+    let tag = root.tag_name();
+    let name = qualified(root, tag.name(), tag.namespace());
+    Ok(Value::Object([(name, element(root))].into_iter().collect()))
 }
 
 fn escape_xml(text: &str) -> String {
@@ -254,5 +301,41 @@ mod tests {
         let xml = json_to_xml(&value).unwrap();
         assert!(!xml.contains("< 2"));
         assert_eq!(xml_to_json(&xml).unwrap(), value);
+    }
+
+    #[test]
+    fn xml_namespaces_are_preserved() {
+        let xml =
+            r#"<a:root xmlns:a="urn:a" xmlns="urn:d"><a:item a:id="1">x</a:item><plain/></a:root>"#;
+        let value = xml_to_json(xml).unwrap();
+        let root = &value["a:root"];
+        assert_eq!(root["@xmlns:a"], "urn:a");
+        assert_eq!(root["@xmlns"], "urn:d");
+        assert_eq!(root["a:item"]["@a:id"], "1");
+        assert_eq!(root["a:item"]["#text"], "x");
+        // Round trip keeps the document equivalent.
+        assert_eq!(xml_to_json(&json_to_xml(&value).unwrap()).unwrap(), value);
+    }
+
+    #[test]
+    fn xml_mixed_content_keeps_all_text() {
+        let value = xml_to_json("<p>Hello <b>big</b> world</p>").unwrap();
+        assert_eq!(value["p"]["#text"], "Hello world");
+        assert_eq!(value["p"]["b"], "big");
+    }
+
+    #[test]
+    fn toml_non_finite_floats_are_not_dropped() {
+        let value = parse("a = nan\nb = inf\nc = -inf\nd = 1.5\n", Format::Toml).unwrap();
+        assert_eq!(value["a"], "nan");
+        assert_eq!(value["b"], "inf");
+        assert_eq!(value["c"], "-inf");
+        assert_eq!(value["d"], 1.5);
+    }
+
+    #[test]
+    fn xml_lang_attribute_keeps_its_prefix() {
+        let value = xml_to_json(r#"<a xml:lang="en">x</a>"#).unwrap();
+        assert_eq!(value["a"]["@xml:lang"], "en");
     }
 }
