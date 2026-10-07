@@ -6,7 +6,7 @@ pub mod tree;
 
 use clock::Clock;
 use drift::formats::{self, Format};
-use drift::{diff, patch, Delta, Operation};
+use drift::{diff_with, patch, Delta, DiffOptions, Operation};
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -117,17 +117,26 @@ pub fn run(
     new_text: &str,
     old_hint: &str,
     new_hint: &str,
+    array_keys: &str,
 ) -> Result<Report, Failure> {
+    let options = DiffOptions {
+        array_keys: array_keys
+            .split(',')
+            .map(str::trim)
+            .filter(|key| !key.is_empty())
+            .map(String::from)
+            .collect(),
+    };
     let total = Clock::start();
     let (old, old_side) = load(old_text, old_hint, "old")?;
     let (new, new_side) = load(new_text, new_hint, "new")?;
 
     let clock = Clock::start();
-    let deltas = diff(&new, &old);
+    let deltas = diff_with(&new, &old, &options);
     let diff_ms = clock.elapsed_ms();
 
     let clock = Clock::start();
-    let tree = tree::build(&old, &new);
+    let tree = tree::build(&old, &new, &options.array_keys);
     let tree_ms = clock.elapsed_ms();
 
     let clock = Clock::start();
@@ -164,8 +173,8 @@ pub fn run(
 /// Diffs two documents and returns a JSON string: a [`Report`], or a
 /// [`Failure`] (`ok: false`) if either input does not parse.
 #[wasm_bindgen]
-pub fn run_diff(old: &str, new: &str, old_hint: &str, new_hint: &str) -> String {
-    let result = match run(old, new, old_hint, new_hint) {
+pub fn run_diff(old: &str, new: &str, old_hint: &str, new_hint: &str, array_keys: &str) -> String {
+    let result = match run(old, new, old_hint, new_hint, array_keys) {
         Ok(report) => serde_json::to_string(&report),
         Err(failure) => serde_json::to_string(&failure),
     };
@@ -190,7 +199,8 @@ mod tests {
 
     #[test]
     fn reports_operations_and_metrics() {
-        let report = run(r#"{"a":1,"b":[1,2]}"#, r#"{"a":2,"b":[1],"c":true}"#, "", "").unwrap();
+        let report =
+            run(r#"{"a":1,"b":[1,2]}"#, r#"{"a":2,"b":[1],"c":true}"#, "", "", "").unwrap();
         assert_eq!(report.metrics.operations, 3);
         assert_eq!(report.metrics.by_op["replace"], 1);
         assert!(report.metrics.roundtrip_ok);
@@ -201,16 +211,42 @@ mod tests {
 
     #[test]
     fn mixed_formats_can_be_compared() {
-        let report = run("a: 1\n", r#"{"a": 2}"#, "x.yaml", "").unwrap();
+        let report = run("a: 1\n", r#"{"a": 2}"#, "x.yaml", "", "").unwrap();
         assert_eq!(report.metrics.old.format, "yaml");
         assert_eq!(report.metrics.operations, 1);
     }
 
     #[test]
     fn parse_failure_names_the_side() {
-        let failure = run("{}", "{", "", "json").err().unwrap();
+        let failure = run("{}", "{", "", "json", "").err().unwrap();
         assert_eq!(failure.side, "new");
         assert!(failure.error.contains("json"));
+    }
+
+    #[test]
+    fn keyed_tree_matches_operations() {
+        use drift::Operation;
+        let keys = vec!["id".to_string()];
+        let options = DiffOptions { array_keys: keys.clone() };
+        let cases = [
+            (
+                json!([{"id": 1, "v": 1}, {"id": 2, "v": 2}]),
+                json!([{"id": 0}, {"id": 1, "v": 1}, {"id": 2, "v": 3}]),
+            ),
+            (json!([{"id": 1}, {"id": 2}, {"id": 3}]), json!([{"id": 3}, {"id": 1}, {"id": 2}])),
+            (
+                json!({"l": [{"id": "a", "t": [1]}, {"id": "b"}]}),
+                json!({"l": [{"id": "b"}, {"id": "a", "t": [1, 2]}]}),
+            ),
+        ];
+        for (old, new) in cases {
+            let ops = diff_with(&new, &old, &options);
+            let changes = ops.iter().filter(|d| d.op != Operation::Move).count();
+            let moves = ops.len() - changes;
+            let tree = tree::build(&old, &new, &keys);
+            assert_eq!(tree::changed_nodes(&tree), changes, "{old} -> {new}");
+            assert_eq!(tree::moved_nodes(&tree), moves, "{old} -> {new}");
+        }
     }
 
     #[test]
@@ -225,15 +261,16 @@ mod tests {
             (json!({"same": [1, 2]}), json!({"same": [1, 2]})),
         ];
         for (old, new) in cases {
-            let ops = diff(&new, &old);
-            let tree = tree::build(&old, &new);
+            let ops = drift::diff(&new, &old);
+            let tree = tree::build(&old, &new, &[]);
             assert_eq!(tree::changed_nodes(&tree), ops.len(), "{old} -> {new}");
         }
     }
 
     #[test]
     fn unchanged_subtrees_are_collapsed() {
-        let tree = tree::build(&json!({"a": {"x": 1}, "b": 1}), &json!({"a": {"x": 1}, "b": 2}));
+        let tree =
+            tree::build(&json!({"a": {"x": 1}, "b": 1}), &json!({"a": {"x": 1}, "b": 2}), &[]);
         let a = &tree.children[0];
         assert_eq!(a.status, tree::Status::Same);
         assert!(a.children.is_empty());

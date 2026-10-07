@@ -82,6 +82,46 @@ assert_eq!(patch(old, &operations)?, new);
 # Ok::<(), drift::DriftError>(())
 ```
 
+## Arrays
+
+By default arrays are compared by position, so inserting an item at the front
+produces a replacement for every item after it. Give drift a field that
+identifies items and it matches them by value instead:
+
+```bash
+drift diff --array-key id old.json new.json   # repeatable; first usable key wins
+```
+
+```rust
+use drift::{diff_with, DiffOptions};
+
+let options = DiffOptions { array_keys: vec!["id".into()] };
+let operations = diff_with(&new, &old, &options);
+```
+
+An array is matched by a key when every item of both arrays is an object with
+a unique string, number or boolean value for it; otherwise that array falls
+back to positional comparison. An insert or delete is then one operation, and a
+reordering produces `move` operations. `--array-key` loads both documents into
+memory; the streaming paths for very large files stay positional.
+
+## Format notes
+
+Documents are converted to a JSON value tree, which loses a few things:
+
+- **XML:** attributes become `@name` keys and text becomes `#text`. Namespace
+  prefixes and `xmlns` declarations are kept. All text of an element is joined,
+  so its position relative to child elements is lost. A single child element
+  reads as an object and repeated children as an array, so a one-entry list
+  reads back as a scalar. Pass `--xml-arrays` (or
+  `ParseOptions { xml_arrays: true }`) to always read children as arrays, which
+  keeps the shape stable across versions of a document.
+- **TOML:** datetimes and `nan`/`inf`/`-inf` become JSON strings, since JSON has
+  neither. `drift patch` (and `formats::parse_with` / `dump_with`) remembers
+  where they were and writes them back as datetimes and floats; a quoted string
+  that merely looks like a date stays a string. Paths into arrays are matched by
+  index, so a patch that shifts an array of datetimes can lose that.
+
 ## Large files
 
 `drift diff` and the `drift::diff_files` library function inspect the inputs and

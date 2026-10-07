@@ -59,6 +59,8 @@ for (const side of ["old", "new"]) {
   });
 }
 
+$("array-keys").addEventListener("input", () => scheduleLive());
+
 const scheduleLive = debounce(() => { if ($("live").checked) compute(); }, 350);
 
 const select = $("example");
@@ -68,6 +70,7 @@ select.addEventListener("change", () => {
   if (!ex) return;
   setText("old", ex.old.text, ex.old.hint);
   setText("new", ex.new.text, ex.new.hint);
+  $("array-keys").value = ex.keys ?? "";
   compute();
 });
 
@@ -89,7 +92,7 @@ function compute() {
   const started = performance.now();
   let result;
   try {
-    result = JSON.parse(run_diff(oldText, newText, hintFor("old"), hintFor("new")));
+    result = JSON.parse(run_diff(oldText, newText, hintFor("old"), hintFor("new"), $("array-keys").value));
   } catch (err) {
     showError(`Unexpected failure: ${err}`);
     return;
@@ -186,9 +189,12 @@ function valueLines(value, key, depth, comma) {
   return out;
 }
 
-function keyLabel(node, parentContainer) {
+// `side` is "old" or "new": key-matched array items sit at different indices on each side.
+function keyLabel(node, parentContainer, side) {
   if (node.key === null) return null;
-  return parentContainer === "array" ? `[${node.key}]` : JSON.stringify(node.key);
+  if (parentContainer !== "array") return JSON.stringify(node.key);
+  if (side === "old") return `[${node.old_index ?? node.key}]`;
+  return node.moved_from === undefined ? `[${node.key}]` : `[${node.key}] ↕moved`;
 }
 
 function cell(text, status, sign) {
@@ -233,46 +239,41 @@ function renderVisual(root) {
   };
 
   // Collapsed unchanged subtree: one row with a button to expand it in place.
-  const sameRow = (node, depth, label, comma) => {
-    const lines = valueLines(node.new, label, depth, comma);
-    const isBlock = lines.length > 1;
-    if (!isBlock || expandAll) { sideBySide(lines, lines, "", "", "", ""); return; }
+  const sameRow = (node, depth, labels, comma) => {
+    const lines = { old: valueLines(node.new, labels.old, depth, comma), new: valueLines(node.new, labels.new, depth, comma) };
+    if (lines.new.length === 1 || expandAll) { sideBySide(lines.old, lines.new, "", "", "", ""); return; }
+    const [open, close] = Array.isArray(node.new) ? ["[", "]"] : ["{", "}"];
     const count = Array.isArray(node.new) ? `${node.new.length} items` : `${Object.keys(node.new).length} keys`;
-    const summary = `${indent(depth)}${label === null ? "" : label + ": "}${Array.isArray(node.new) ? "[" : "{"} … ${count} ${Array.isArray(node.new) ? "]" : "}"}${comma ? "," : ""}`;
-    const make = () => {
-      const left = el("div", "cell"), right = el("div", "cell");
-      for (const c of [left, right]) {
-        const btn = el("button", "fold", summary);
-        btn.type = "button";
-        btn.title = "Expand unchanged section";
-        btn.addEventListener("click", () => {
-          const holder = document.createDocumentFragment();
-          const temp = [];
-          lines.forEach((l) => temp.push(row(cell(l, "", ""), cell(l, "", ""))));
-          temp.forEach((t) => holder.append(t));
-          r.replaceWith(holder);
-        });
-        c.append(btn);
-      }
-      return [left, right];
-    };
-    const [l, rgt] = make();
-    const r = row(l, rgt);
+    const summary = (label) => `${indent(depth)}${label === null ? "" : label + ": "}${open} … ${count} ${close}${comma ? "," : ""}`;
+    const r = el("div", "row");
+    for (const side of ["old", "new"]) {
+      const c = el("div", "cell");
+      const btn = el("button", "fold", summary(labels[side]));
+      btn.type = "button";
+      btn.title = "Expand unchanged section";
+      btn.addEventListener("click", () => {
+        const holder = document.createDocumentFragment();
+        lines.new.forEach((_, i) => holder.append(row(cell(lines.old[i], "", ""), cell(lines.new[i], "", ""))));
+        r.replaceWith(holder);
+      });
+      c.append(btn);
+      r.append(c);
+    }
     push(r);
   };
 
   const walk = (node, depth, parentContainer, comma) => {
-    const label = keyLabel(node, parentContainer);
+    const labels = { old: keyLabel(node, parentContainer, "old"), new: keyLabel(node, parentContainer, "new") };
     switch (node.status) {
-      case "same": return sameRow(node, depth, label, comma);
-      case "added": return sideBySide([], valueLines(node.new, label, depth, comma), "", "added", "", "+");
-      case "removed": return sideBySide(valueLines(node.old, label, depth, comma), [], "removed", "", "−", "");
+      case "same": return sameRow(node, depth, labels, comma);
+      case "added": return sideBySide([], valueLines(node.new, labels.new, depth, comma), "", "added", "", "+");
+      case "removed": return sideBySide(valueLines(node.old, labels.old, depth, comma), [], "removed", "", "−", "");
       case "changed":
-        return sideBySide(valueLines(node.old, label, depth, comma), valueLines(node.new, label, depth, comma), "changed", "changed", "~", "~");
+        return sideBySide(valueLines(node.old, labels.old, depth, comma), valueLines(node.new, labels.new, depth, comma), "changed", "changed", "~", "~");
       case "nested": {
         const [open, close] = node.container === "array" ? ["[", "]"] : ["{", "}"];
-        const head = `${indent(depth)}${label === null ? "" : label + ": "}${open}`;
-        sideBySide([head], [head], "", "", "", "");
+        const head = (label) => `${indent(depth)}${label === null ? "" : label + ": "}${open}`;
+        sideBySide([head(labels.old)], [head(labels.new)], "", "", "", "");
         node.children.forEach((child, i) => walk(child, depth + 1, node.container, i < node.children.length - 1));
         const tail = `${indent(depth)}${close}${comma ? "," : ""}`;
         sideBySide([tail], [tail], "", "", "", "");
@@ -365,7 +366,8 @@ async function boot() {
     await init({ module_or_path: bytes });
     $("version").textContent = `v${version()}`;
     $("loading").hidden = true;
-    select.value = "0";
+    const wanted = new URLSearchParams(location.search).get("example");
+    select.value = wanted !== null && EXAMPLES[Number(wanted)] ? wanted : "0";
     select.dispatchEvent(new Event("change"));
   } catch (err) {
     $("loading").hidden = true;

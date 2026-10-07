@@ -38,7 +38,7 @@ nav { display: flex; gap: 14px; align-items: center; font-size: 14px; flex: none
 .intro p { margin: 0; max-width: 62ch; }
 .example { font-size: 14px; color: var(--muted); display: flex; gap: 8px; align-items: center; }
 
-select, input[type=search], textarea {
+select, input[type=search], input[type=text], textarea {
   font: inherit; color: var(--ink); background: var(--surface); border: 1px solid var(--line); border-radius: 8px;
 }
 select { padding: 5px 8px; font-size: 14px; }
@@ -132,3 +132,6 @@ pre.raw { margin: 0; background: var(--surface); border: 1px solid var(--line); 
   .tag { display: none; }
   .pane textarea { height: 180px; }
 }
+
+input.keys { font: 13px var(--code); padding: 5px 8px; width: 150px; color: var(--ink); background: var(--surface); border: 1px solid var(--line); border-radius: 8px; }
+.cell .moved { opacity: .7; font-style: italic; }

@@ -98,6 +98,11 @@ jobs:
           new_version="${{ needs.check-release.outputs.new_version }}"
           sed -i "s/^version = .*/version = \"$new_version\"/" Cargo.toml
 
+      - name: Update version in web/Cargo.toml
+        run: |
+          new_version="${{ needs.check-release.outputs.new_version }}"
+          sed -i "s/^version = .*/version = \"$new_version\"/" web/Cargo.toml
+
       - name: Update version in lib.rs
         shell: bash
         run: |
@@ -148,7 +153,7 @@ jobs:
           git config --local user.name "github-actions[bot]"
           
           if [ -n "$(git status --porcelain)" ]; then
-            git add Cargo.toml Cargo.lock src/lib.rs CHANGELOG.md
+            git add Cargo.toml web/Cargo.toml Cargo.lock src/lib.rs CHANGELOG.md
             git commit -m "chore(release): bump to $new_version"
             git push origin main
           fi
