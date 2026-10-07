@@ -31,6 +31,9 @@ pub struct Node {
     /// Value in the new document (added, changed and unchanged leaves).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub new: Option<Value>,
+    /// Index in the old array, for key-matched items (the old side shows this).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub old_index: Option<usize>,
     /// Index in the old array of a key-matched item that changed position.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub moved_from: Option<usize>,
@@ -49,6 +52,7 @@ impl Node {
             old: old.cloned(),
             new: new.cloned(),
             container: None,
+            old_index: None,
             moved_from: None,
             children: Vec::new(),
         }
@@ -102,6 +106,7 @@ fn node(key: Option<String>, old: &Value, new: &Value, keys: &[String]) -> Node 
         old: None,
         new: None,
         container: Some(container),
+        old_index: None,
         moved_from: None,
         children,
     }
@@ -127,6 +132,7 @@ fn keyed_children(
                 let from =
                     current.iter().position(|&slot| slot == Some(old_index)).unwrap_or(index);
                 let mut child = node(key, &old[old_index], item, keys);
+                child.old_index = Some(old_index);
                 if from != index {
                     let slot = current.remove(from);
                     current.insert(index, slot);
