@@ -82,6 +82,42 @@ assert_eq!(patch(old, &operations)?, new);
 # Ok::<(), drift::DriftError>(())
 ```
 
+## Arrays
+
+By default arrays are compared by position, so inserting an item at the front
+produces a replacement for every item after it. Give drift a field that
+identifies items and it matches them by value instead:
+
+```bash
+drift diff --array-key id old.json new.json   # repeatable; first usable key wins
+```
+
+```rust
+use drift::{diff_with, DiffOptions};
+
+let options = DiffOptions { array_keys: vec!["id".into()] };
+let operations = diff_with(&new, &old, &options);
+```
+
+An array is matched by a key when every item of both arrays is an object with
+a unique string, number or boolean value for it; otherwise that array falls
+back to positional comparison. An insert or delete is then one operation, and a
+reordering produces `move` operations. `--array-key` loads both documents into
+memory; the streaming paths for very large files stay positional.
+
+## Format notes
+
+Documents are converted to a JSON value tree, which loses a few things:
+
+- **XML:** attributes become `@name` keys and text becomes `#text`. Namespace
+  prefixes and `xmlns` declarations are kept. All text of an element is joined,
+  so its position relative to child elements is lost. One child element is an
+  object and repeated children are an array, so a list with a single entry
+  reads back as a scalar.
+- **TOML:** datetimes become strings (so patching a TOML file writes them back
+  as quoted strings), and `nan`/`inf`/`-inf` become the strings `"nan"`,
+  `"inf"` and `"-inf"` since JSON cannot represent them.
+
 ## Large files
 
 `drift diff` and the `drift::diff_files` library function inspect the inputs and
