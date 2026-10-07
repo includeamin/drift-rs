@@ -34,6 +34,24 @@ No Rust toolchain required.
 - macOS Apple Silicon (aarch64)
 - Windows x86_64
 
+## Try it in the browser
+
+An interactive demo runs drift as WebAssembly, entirely client-side. Paste or
+drop two JSON, YAML, TOML or XML documents to get a side-by-side visual diff,
+the RFC 6902 operations, and metrics (parse and diff time, sizes, operation
+counts, and a patch round-trip check).
+
+Live at <https://includeamin.github.io/drift-rs/> once Pages is enabled
+(Settings → Pages → Source: *GitHub Actions*).
+
+To run it locally:
+
+```bash
+make web-serve    # needs wasm-pack; serves http://localhost:8000
+```
+
+The WASM bindings live in [`web/`](web/) and reuse `drift::formats` for parsing.
+
 ## CLI
 
 ```bash

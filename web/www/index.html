@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>drift · structured diff in your browser</title>
+<meta name="description" content="Paste two JSON, YAML, TOML or XML documents and see an RFC 6902 diff, computed locally with WebAssembly.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230f766e'/%3E%3Cpath d='M9 9h6v14H9zM17 9h6v14h-6z' fill='none' stroke='%23fff' stroke-width='2.4'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="top">
+  <div class="wrap top-inner">
+    <div class="brand">
+      <span class="logo" aria-hidden="true"></span>
+      <h1>drift</h1>
+      <span class="tag">RFC 6902 diff &middot; runs locally via WebAssembly</span>
+    </div>
+    <nav>
+      <span id="version" class="muted"></span>
+      <a href="https://github.com/includeamin/drift-rs">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<main class="wrap">
+  <section class="intro">
+    <p>Paste or drop two documents. <strong>JSON, YAML, TOML and XML</strong> are supported, and you can even compare across formats. Nothing leaves your browser.</p>
+    <label class="example">Try an example
+      <select id="example"><option value="">Choose…</option></select>
+    </label>
+  </section>
+
+  <section class="inputs" aria-label="Inputs">
+    <div class="pane" id="pane-old">
+      <div class="pane-head">
+        <h2>Old</h2>
+        <span class="detected" id="detected-old"></span>
+        <select id="fmt-old" aria-label="Old format">
+          <option value="">Auto</option><option>json</option><option>yaml</option><option>toml</option><option>xml</option>
+        </select>
+        <label class="btn small">Upload<input type="file" id="file-old" hidden></label>
+      </div>
+      <textarea id="text-old" spellcheck="false" placeholder="Paste or drop the original document…"></textarea>
+      <div class="pane-foot" id="foot-old"></div>
+    </div>
+    <div class="pane" id="pane-new">
+      <div class="pane-head">
+        <h2>New</h2>
+        <span class="detected" id="detected-new"></span>
+        <select id="fmt-new" aria-label="New format">
+          <option value="">Auto</option><option>json</option><option>yaml</option><option>toml</option><option>xml</option>
+        </select>
+        <label class="btn small">Upload<input type="file" id="file-new" hidden></label>
+      </div>
+      <textarea id="text-new" spellcheck="false" placeholder="Paste or drop the modified document…"></textarea>
+      <div class="pane-foot" id="foot-new"></div>
+    </div>
+  </section>
+
+  <div class="actions">
+    <button class="btn primary" id="run">Compute diff <kbd>Ctrl</kbd>+<kbd>Enter</kbd></button>
+    <button class="btn" id="swap">Swap</button>
+    <button class="btn" id="clear">Clear</button>
+    <label class="check"><input type="checkbox" id="live" checked> Live</label>
+  </div>
+
+  <div id="error" class="error" role="alert" hidden></div>
+  <div id="loading" class="muted">Loading WebAssembly…</div>
+
+  <section id="results" hidden>
+    <h2 class="sr">Metrics</h2>
+    <div class="metrics" id="metrics"></div>
+
+    <div class="tabs" role="tablist">
+      <button role="tab" class="tab active" data-tab="visual" aria-selected="true">Visual diff</button>
+      <button role="tab" class="tab" data-tab="ops" aria-selected="false">Operations <span class="count" id="count-ops"></span></button>
+      <button role="tab" class="tab" data-tab="raw" aria-selected="false">Raw output</button>
+    </div>
+
+    <div class="tabpanel" id="tab-visual">
+      <div class="toolbar">
+        <div class="legend">
+          <span class="chip added">added</span><span class="chip removed">removed</span><span class="chip changed">changed</span>
+        </div>
+        <label class="check"><input type="checkbox" id="show-same"> Expand unchanged</label>
+      </div>
+      <p class="note" id="array-note" hidden>Heads up: drift compares arrays by position, so inserting an item near the start of an array shows up as a run of changes after it.</p>
+      <div class="sbs-head"><span>Old</span><span>New</span></div>
+      <div class="sbs" id="sbs" role="table" aria-label="Side by side diff"></div>
+    </div>
+
+    <div class="tabpanel" id="tab-ops" hidden>
+      <div class="toolbar">
+        <div class="filters" id="op-filters"></div>
+        <input type="search" id="op-search" placeholder="Filter by path or value…" aria-label="Filter operations">
+      </div>
+      <div class="table-wrap"><table class="ops"><thead><tr><th>Op</th><th>Path</th><th>Value</th></tr></thead><tbody id="ops-body"></tbody></table></div>
+    </div>
+
+    <div class="tabpanel" id="tab-raw" hidden>
+      <div class="toolbar">
+        <div class="seg" role="group" aria-label="Raw format">
+          <button class="seg-btn active" data-raw="json">RFC 6902 JSON</button>
+          <button class="seg-btn" data-raw="pretty">Compact (CLI --pretty)</button>
+        </div>
+        <div class="grow"></div>
+        <button class="btn small" id="copy">Copy</button>
+        <button class="btn small" id="download">Download</button>
+      </div>
+      <pre class="raw" id="raw"></pre>
+    </div>
+  </section>
+</main>
+
+<footer class="wrap foot">
+  <span>Built with <a href="https://github.com/includeamin/drift-rs">drift-rs</a> compiled to WebAssembly.</span>
+</footer>
+
+<script type="module" src="app.js"></script>
+</body>
+</html>

@@ -254,6 +254,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "drift-wasm"
+version = "0.14.1"
+dependencies = [
+ "drift",
+ "serde",
+ "serde_json",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "either"
 version = "1.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
