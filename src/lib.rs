@@ -39,6 +39,7 @@
 mod diff;
 mod error;
 pub mod formats;
+mod invert;
 mod model;
 mod patch;
 mod paths;
@@ -50,6 +51,7 @@ pub mod streaming;
 
 pub use diff::{diff, diff_with, match_array_items, DiffOptions};
 pub use error::DriftError;
+pub use invert::{compose, invert};
 pub use model::{Delta, Operation};
 pub use patch::patch;
 pub use paths::list_json_paths;

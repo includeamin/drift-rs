@@ -15,7 +15,7 @@ fn array_index(segment: &str, length: usize, allow_end: bool) -> Result<usize, D
     Ok(index)
 }
 
-fn get<'a>(document: &'a Value, path: &str) -> Result<&'a Value, DriftError> {
+pub(crate) fn get<'a>(document: &'a Value, path: &str) -> Result<&'a Value, DriftError> {
     let mut current = document;
     for segment in split_pointer(path)? {
         current = match current {

@@ -82,6 +82,31 @@ assert_eq!(patch(old, &operations)?, new);
 # Ok::<(), drift::DriftError>(())
 ```
 
+### Patches as data, undo and squash
+
+`Delta` reads and writes the standard RFC 6902 JSON, so a patch is a
+`Vec<Delta>` and travels through serde like any other value. Reading checks
+what the RFC requires: `op` and `path`, `value` for `add`/`replace`/`test`, and
+`from` for `move`/`copy`.
+
+```rust
+use drift::{compose, diff, invert, patch, DiffOptions};
+
+let operations = diff(&new, &old);
+let json = serde_json::to_string(&operations)?;          // store or send it
+
+let undo = invert(&old, &operations)?;                    // the patch that reverses it
+assert_eq!(patch(new.clone(), &undo)?, old);
+
+let squashed = compose(&old, &many_steps, &DiffOptions::default())?;  // one equivalent patch
+```
+
+`invert` replays the patch against the document it applies to, so it must apply
+cleanly. Undoing a removal puts an object member back as a new key, so the
+restored document is equal to the original but the member can sit last instead
+of where it was. `compose` needs the same base document: it is the difference
+between that document and the patched one.
+
 ### Cargo features
 
 | Feature | Enables |
