@@ -353,4 +353,16 @@ mod tests {
         let message = parse("<a/>", Format::Xml).unwrap_err().to_string();
         assert!(message.contains("`xml` feature"), "{message}");
     }
+
+    #[test]
+    #[cfg(feature = "xml")]
+    fn deeply_nested_xml_is_an_error_not_a_crash() {
+        let nested = |depth: usize| format!("{}x{}", "<a>".repeat(depth), "</a>".repeat(depth));
+        // The same limit as JSON and YAML: 128 levels are fine, 129 are not.
+        assert!(parse(&nested(128), Format::Xml).is_ok());
+        let message = parse(&nested(129), Format::Xml).unwrap_err().to_string();
+        assert!(message.contains("recursion limit"), "{message}");
+        // Far past what the stack could hold; must fail cleanly.
+        assert!(parse(&nested(200_000), Format::Xml).is_err());
+    }
 }

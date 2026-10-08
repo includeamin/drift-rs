@@ -134,6 +134,8 @@ Documents are converted to a JSON value tree, which loses a few things:
   reads back as a scalar. Pass `--xml-arrays` (or
   `ParseOptions { xml_arrays: true }`) to always read children as arrays, which
   keeps the shape stable across versions of a document.
+- **Depth:** JSON, YAML and XML documents nested more than 128 levels deep are
+  rejected with a `recursion limit exceeded` error.
 - **TOML:** datetimes and `nan`/`inf`/`-inf` become JSON strings, since JSON has
   neither. `drift patch` (and `formats::parse_with` / `dump_with`) remembers
   where they were and writes them back as datetimes and floats; a quoted string
