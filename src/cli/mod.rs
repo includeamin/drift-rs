@@ -142,6 +142,17 @@ fn delta_json(delta: &Delta) -> Value {
     Value::Object(map)
 }
 
+/// Operations per type, with types in alphabetical order so the output is stable.
+fn op_counts(operations: &[Delta]) -> Value {
+    let mut counts = std::collections::BTreeMap::new();
+    for operation in operations {
+        *counts.entry(operation.op.as_str()).or_insert(0u64) += 1;
+    }
+    Value::Object(
+        counts.into_iter().map(|(op, count)| (op.to_string(), Value::from(count))).collect(),
+    )
+}
+
 fn cmd_diff(args: DiffArgs) -> Result<i32, Box<dyn std::error::Error>> {
     let format = resolve(args.format, &args.old);
 
@@ -192,11 +203,7 @@ fn cmd_diff(args: DiffArgs) -> Result<i32, Box<dyn std::error::Error>> {
         write_output(text, &args.output.output)?;
     } else {
         let payload = if args.stats {
-            let mut counts = serde_json::Map::new();
-            for operation in &operations {
-                let count = counts.entry(operation.op.as_str()).or_insert(Value::from(0));
-                *count = Value::from(count.as_u64().unwrap_or(0) + 1);
-            }
+            let counts = op_counts(&operations);
             serde_json::json!({"total": operations.len(), "by_op": counts})
         } else {
             Value::Array(operations.iter().map(delta_json).collect())
@@ -291,4 +298,23 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         Command::Check(args) => cmd_check(args)?,
     };
     std::process::exit(code)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn op_counts_are_alphabetical_whatever_the_operation_order() {
+        let ops = [
+            Delta::new(Operation::Replace, "/a"),
+            Delta::new(Operation::Remove, "/b"),
+            Delta::new(Operation::Add, "/c"),
+            Delta::new(Operation::Remove, "/d"),
+        ];
+        assert_eq!(
+            serde_json::to_string(&op_counts(&ops)).unwrap(),
+            r#"{"add":1,"remove":2,"replace":1}"#
+        );
+    }
 }

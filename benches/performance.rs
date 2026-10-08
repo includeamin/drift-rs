@@ -102,6 +102,22 @@ fn bench_large_array_patch(c: &mut Criterion) {
     });
 }
 
+/// Dropping half the keys of a large object. Removals keep the remaining keys
+/// in order, which is quadratic if done one key at a time.
+fn bench_large_object_removals(c: &mut Criterion) {
+    let build = |keep: &dyn Fn(usize) -> bool| {
+        Value::Object(
+            (0..20_000).filter(|i| keep(*i)).map(|i| (format!("k{i}"), json!(i))).collect(),
+        )
+    };
+    let doc = build(&|_| true);
+    let operations = diff(&build(&|i| i % 2 == 0), &doc);
+
+    c.bench_function("patch_large_object_10000_removals", |b| {
+        b.iter(|| patch(black_box(doc.clone()), black_box(&operations)))
+    });
+}
+
 // Benchmarks for path listing
 fn bench_path_listing_small(c: &mut Criterion) {
     let doc = json!({"a": {"b": {"c": "value"}}});
@@ -232,6 +248,7 @@ criterion_group!(
     // Large objects
     bench_large_array_diff,
     bench_large_array_patch,
+    bench_large_object_removals,
     // Path listing
     bench_path_listing_small,
     bench_path_listing_medium,
