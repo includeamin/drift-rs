@@ -3,7 +3,7 @@ members = [".", "web"]
 
 [package]
 name = "drift"
-version = "0.16.0"
+version = "0.17.0"
 edition = "2021"
 rust-version = "1.71"
 description = "Calculate RFC 6902 JSON Patch operations between structured documents"
