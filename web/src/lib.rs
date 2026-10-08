@@ -6,7 +6,7 @@ pub mod tree;
 
 use clock::Clock;
 use drift::formats::{self, Format};
-use drift::{diff_with, patch, Delta, DiffOptions, Operation};
+use drift::{diff_with, patch, DiffOptions};
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -52,21 +52,6 @@ pub struct Failure {
     /// "old" or "new": which input failed to parse.
     pub side: &'static str,
     pub error: String,
-}
-
-fn delta_json(delta: &Delta) -> Value {
-    let mut map = serde_json::Map::new();
-    map.insert("op".into(), delta.op.as_str().into());
-    map.insert("path".into(), delta.path.clone().into());
-    if let Some(value) = &delta.value {
-        if matches!(delta.op, Operation::Add | Operation::Replace | Operation::Test) {
-            map.insert("value".into(), value.clone());
-        }
-    }
-    if let Some(from) = &delta.from_path {
-        map.insert("from".into(), from.clone().into());
-    }
-    Value::Object(map)
 }
 
 fn measure(value: &Value) -> (usize, usize) {
@@ -147,7 +132,8 @@ pub fn run(
     for delta in &deltas {
         *by_op.entry(delta.op.as_str()).or_insert(0) += 1;
     }
-    let operations: Vec<Value> = deltas.iter().map(delta_json).collect();
+    let operations: Vec<Value> =
+        deltas.iter().filter_map(|d| serde_json::to_value(d).ok()).collect();
     let raw_pretty = serde_json::to_string_pretty(&operations).unwrap_or_default();
 
     Ok(Report {
