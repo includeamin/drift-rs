@@ -26,3 +26,48 @@ jobs:
         run: cargo test --workspace --all-targets
       - name: Build release binary
         run: cargo build --release
+
+  features:
+    name: Feature combinations
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        features:
+          - "--no-default-features"
+          - "--no-default-features --features yaml"
+          - "--no-default-features --features toml"
+          - "--no-default-features --features xml"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Run Clippy
+        run: cargo clippy -p drift --lib --tests ${{ matrix.features }} -- -D warnings
+      - name: Test
+        run: cargo test -p drift --lib ${{ matrix.features }}
+
+  msrv:
+    name: Minimum Rust version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build on the declared rust-version
+        run: scripts/check-msrv.sh
+
+  docs:
+    name: Documentation
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build docs without and with all features
+        run: |
+          cargo doc -p drift --no-deps --no-default-features
+          cargo doc -p drift --no-deps
+      - name: Package the crate
+        run: cargo package -p drift

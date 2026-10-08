@@ -6,8 +6,8 @@
 
 use drift::match_array_items;
 use serde::Serialize;
-use serde_json::Value;
-use std::collections::{BTreeSet, HashSet};
+use serde_json::{Map, Value};
+use std::collections::HashSet;
 
 #[derive(Serialize, Clone, Copy, PartialEq, Eq, Debug)]
 #[serde(rename_all = "lowercase")]
@@ -72,18 +72,15 @@ fn node(key: Option<String>, old: &Value, new: &Value, keys: &[String]) -> Node 
     }
     let container = if new.is_array() { "array" } else { "object" };
     let children = match (old, new) {
-        (Value::Object(o), Value::Object(n)) => {
-            let names: BTreeSet<&String> = o.keys().chain(n.keys()).collect();
-            names
-                .into_iter()
-                .map(|k| match (o.get(k), n.get(k)) {
-                    (Some(a), Some(b)) => node(Some(k.clone()), a, b, keys),
-                    (Some(a), None) => Node::leaf(Some(k.clone()), Status::Removed, Some(a), None),
-                    (None, Some(b)) => Node::leaf(Some(k.clone()), Status::Added, None, Some(b)),
-                    (None, None) => unreachable!(),
-                })
-                .collect()
-        }
+        (Value::Object(o), Value::Object(n)) => merged_keys(o, n)
+            .into_iter()
+            .map(|k| match (o.get(k), n.get(k)) {
+                (Some(a), Some(b)) => node(Some(k.clone()), a, b, keys),
+                (Some(a), None) => Node::leaf(Some(k.clone()), Status::Removed, Some(a), None),
+                (None, Some(b)) => Node::leaf(Some(k.clone()), Status::Added, None, Some(b)),
+                (None, None) => unreachable!(),
+            })
+            .collect(),
         (Value::Array(o), Value::Array(n)) => match match_array_items(n, o, keys) {
             Some(matches) => keyed_children(o, n, &matches, keys),
             None => (0..o.len().max(n.len()))
@@ -110,6 +107,23 @@ fn node(key: Option<String>, old: &Value, new: &Value, keys: &[String]) -> Node 
         moved_from: None,
         children,
     }
+}
+
+/// Keys of both objects in document order: the new document's order, with each
+/// removed key placed after the nearest preceding key it had in the old one.
+fn merged_keys<'a>(old: &'a Map<String, Value>, new: &'a Map<String, Value>) -> Vec<&'a String> {
+    let mut order: Vec<&String> = new.keys().collect();
+    let mut previous: Option<&String> = None;
+    for key in old.keys() {
+        if new.contains_key(key) {
+            previous = Some(key);
+            continue;
+        }
+        let at = previous.and_then(|p| order.iter().position(|k| *k == p)).map_or(0, |i| i + 1);
+        order.insert(at, key);
+        previous = Some(key);
+    }
+    order
 }
 
 /// Children of a key-matched array: new items in new order (paired with their
@@ -164,4 +178,22 @@ pub fn changed_nodes(node: &Node) -> usize {
 /// Number of key-matched items that changed position, i.e. expected `move` ops.
 pub fn moved_nodes(node: &Node) -> usize {
     usize::from(node.moved_from.is_some()) + node.children.iter().map(moved_nodes).sum::<usize>()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn keys(node: &Node) -> Vec<&str> {
+        node.children.iter().map(|c| c.key.as_deref().unwrap()).collect()
+    }
+
+    #[test]
+    fn children_follow_document_order_with_removed_keys_in_place() {
+        let old = json!({"zebra": 1, "gone": 1, "apple": 1});
+        let new = json!({"zebra": 2, "apple": 1, "fresh": 1});
+        // `gone` stays right after `zebra`, where it was; `fresh` is last, as in the new document.
+        assert_eq!(keys(&build(&old, &new, &[])), ["zebra", "gone", "apple", "fresh"]);
+    }
 }

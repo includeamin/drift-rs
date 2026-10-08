@@ -5,9 +5,16 @@ members = [".", "web"]
 name = "drift"
 version = "0.16.0"
 edition = "2021"
-rust-version = "1.70"
+rust-version = "1.71"
 description = "Calculate RFC 6902 JSON Patch operations between structured documents"
 license = "MIT"
+repository = "https://github.com/includeamin/drift-rs"
+homepage = "https://includeamin.github.io/drift-rs/"
+readme = "README.md"
+keywords = ["json-patch", "diff", "rfc6902", "yaml", "toml"]
+categories = ["command-line-utilities", "development-tools", "encoding"]
+# The demo, CI config and release tooling are not part of the published crate.
+exclude = ["web/", ".github/", "scripts/", "codecov.yml", "cliff.toml", "install.sh", "Makefile"]
 
 [lib]
 name = "drift"
@@ -16,15 +23,25 @@ path = "src/lib.rs"
 [[bin]]
 name = "drift"
 path = "src/main.rs"
+required-features = ["cli"]
+
+[features]
+default = ["cli", "yaml", "toml", "xml"]
+# The `drift` binary. Needs every format, since it detects them by extension.
+cli = ["dep:clap", "yaml", "toml", "xml"]
+# Optional document formats for `drift::formats`. JSON is always available.
+yaml = ["dep:serde_yaml"]
+toml = ["dep:toml"]
+xml = ["dep:roxmltree"]
 
 [dependencies]
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive"], optional = true }
 regex = "1"
-roxmltree = "0.20"
+roxmltree = { version = "0.20", optional = true }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-serde_yaml = "0.9"
-toml = "0.8"
+serde_json = { version = "1", features = ["preserve_order"] }
+serde_yaml = { version = "0.9", optional = true }
+toml = { version = "0.8", features = ["preserve_order"], optional = true }
 thiserror = "2"
 
 [dev-dependencies]

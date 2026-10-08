@@ -2,6 +2,11 @@ use crate::{split_pointer, Delta, DriftError};
 use regex::Regex;
 use serde_json::Value;
 
+/// Whether `path` matches the glob `pattern`, both JSON Pointers.
+///
+/// `*` stands for exactly one token and `**` for any number, including none:
+/// `/users/*/name` matches `/users/0/name`, and `/a/**` matches `/a` and
+/// everything under it.
 pub fn path_matches(pattern: &str, path: &str) -> Result<bool, DriftError> {
     let pattern = split_pointer(pattern)?;
     let path = split_pointer(path)?;
@@ -60,6 +65,18 @@ fn overwritten_values(old: &Value, operations: &[Delta]) -> Vec<Option<Value>> {
         .collect()
 }
 
+/// Keeps the operations that match every given filter, or those that do not
+/// when `invert` is set. An empty filter list matches everything.
+///
+/// - `paths`: glob patterns for [`path_matches`]; any may match.
+/// - `fields`: regular expressions for the last token of the path.
+/// - `values`: regular expressions tried against the operation's path and
+///   JSON-serialised value and, with `old` given, the value a `remove` or
+///   `replace` overwrites.
+/// - `operation_types`: names such as `"add"` (see [`Operation::as_str`](crate::Operation::as_str)).
+///
+/// `old` is the document the operations were computed against; without it,
+/// `values` cannot see overwritten values.
 pub fn filter_operations(
     operations: &[Delta],
     old: Option<&Value>,
@@ -151,5 +168,14 @@ mod tests {
             filter_operations(&ops, Some(&old), &[], &[], &["^3$".into()], &[], false).unwrap();
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].path, "/xs/2");
+    }
+
+    #[test]
+    fn double_star_matches_zero_or_more_tokens() {
+        assert!(path_matches("/a/**", "/a").unwrap());
+        assert!(path_matches("/a/**", "/a/b/c").unwrap());
+        assert!(path_matches("/users/*/name", "/users/0/name").unwrap());
+        assert!(!path_matches("/users/*/name", "/users/0/1/name").unwrap());
+        assert!(!path_matches("/a/**", "/b").unwrap());
     }
 }

@@ -82,6 +82,24 @@ assert_eq!(patch(old, &operations)?, new);
 # Ok::<(), drift::DriftError>(())
 ```
 
+### Cargo features
+
+| Feature | Enables |
+|---------|---------|
+| `yaml`, `toml`, `xml` | Reading and writing that format in `drift::formats` (JSON is always available) |
+| `cli` | The `drift` binary (implies the three formats) |
+
+All are on by default. A library user who only needs JSON can drop the rest,
+which also drops `serde_yaml`, `toml`, `roxmltree` and `clap` from the build:
+
+```toml
+drift = { version = "0.15", default-features = false }
+```
+
+Using a format whose feature is off returns an error naming the feature to
+enable. The minimum supported Rust version is 1.71, checked in CI by
+`scripts/check-msrv.sh`.
+
 ## Arrays
 
 By default arrays are compared by position, so inserting an item at the front
@@ -149,6 +167,11 @@ Peak memory for the in-memory path runs 15-27x the file size, because a
 `serde_json::Value` tree is much larger than its serialized form. The streaming
 path stays flat regardless of input size.
 
+The table was measured before objects kept their key order. Preserving order
+costs the in-memory path about a third more memory (a 36 MB array of 400k
+objects: 857 MB before, 1,157 MB now) at about the same speed; streaming is
+unchanged.
+
 ```rust
 use drift::diff_files;
 use std::path::Path;
@@ -204,7 +227,8 @@ cargo run --release --example streaming_large_files
 
 ## Build and test
 
-Rust 1.70 or newer is required:
+The library supports Rust 1.71 or newer (checked in CI). Building and testing
+this repository, including the web demo, uses the current stable toolchain:
 
 ```bash
 cargo test

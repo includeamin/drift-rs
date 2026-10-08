@@ -42,6 +42,12 @@ fn walk(value: &Value, path: &str, depth: usize, options: &PathOptions, result: 
     }
 }
 
+/// Lists the JSON Pointers of the values in a document, in document order.
+///
+/// By default only leaves are listed. `include_containers` also lists objects
+/// and arrays that have members, and `include_root` includes the root pointer
+/// `""`. `sort_keys` sorts object keys instead of using document order, and
+/// `max_depth` stops descending past that many levels.
 pub fn list_json_paths(
     value: &Value,
     include_root: bool,
