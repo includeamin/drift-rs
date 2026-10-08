@@ -63,6 +63,11 @@ struct DiffArgs {
     /// instead of by position. Loads both documents into memory.
     #[arg(long = "array-key")]
     array_keys: Vec<String>,
+    /// Leave this part of the document out of the diff (repeatable). A JSON
+    /// Pointer where `*` matches one token and `**` any number: `/updatedAt`,
+    /// `/users/*/lastSeen`, `/**/id`. Loads both documents into memory.
+    #[arg(long = "ignore-path")]
+    ignore_paths: Vec<String>,
     #[command(flatten)]
     output: OutputArgs,
 }
@@ -154,6 +159,12 @@ fn op_counts(operations: &[Delta]) -> Value {
 }
 
 fn cmd_diff(args: DiffArgs) -> Result<i32, Box<dyn std::error::Error>> {
+    // A pattern that is not a JSON Pointer would silently match nothing.
+    for pattern in &args.ignore_paths {
+        drift::split_pointer(pattern).map_err(|_| {
+            format!("invalid --ignore-path `{pattern}`: it must be empty or a JSON Pointer starting with `/`")
+        })?;
+    }
     let format = resolve(args.format, &args.old);
 
     // `--grep` inspects old values, so it needs the whole old document in memory.
@@ -161,14 +172,16 @@ fn cmd_diff(args: DiffArgs) -> Result<i32, Box<dyn std::error::Error>> {
         && args.old != "-"
         && args.new != "-"
         && args.values.is_empty()
-        && args.array_keys.is_empty();
+        && args.array_keys.is_empty()
+        && args.ignore_paths.is_empty();
 
     let (diff_operations, old) = if delegate {
         (diff_files(Path::new(&args.old), Path::new(&args.new))?, None)
     } else {
         let old = load(&args.old, format, args.xml_arrays)?.0;
         let new = load(&args.new, format, args.xml_arrays)?.0;
-        let options = DiffOptions { array_keys: args.array_keys.clone() };
+        let options = args.array_keys.iter().fold(DiffOptions::new(), |o, key| o.array_key(key));
+        let options = args.ignore_paths.iter().fold(options, |o, pattern| o.ignore_path(pattern));
         (diff_with(&new, &old, &options), Some(old))
     };
 
