@@ -103,13 +103,6 @@ jobs:
           new_version="${{ needs.check-release.outputs.new_version }}"
           sed -i "s/^version = .*/version = \"$new_version\"/" web/Cargo.toml
 
-      - name: Update version in lib.rs
-        shell: bash
-        run: |
-          set -euo pipefail
-          new_version="${{ needs.check-release.outputs.new_version }}"
-          sed -i "s/pub const VERSION: &str = .*/pub const VERSION: \&str = \"$new_version\";/" src/lib.rs
-
       - name: Sync Cargo.lock
         shell: bash
         # Updates the workspace member version only; third-party deps stay pinned.
@@ -153,7 +146,7 @@ jobs:
           git config --local user.name "github-actions[bot]"
           
           if [ -n "$(git status --porcelain)" ]; then
-            git add Cargo.toml web/Cargo.toml Cargo.lock src/lib.rs CHANGELOG.md
+            git add Cargo.toml web/Cargo.toml Cargo.lock CHANGELOG.md
             git commit -m "chore(release): bump to $new_version"
             git push origin main
           fi
