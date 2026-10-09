@@ -69,6 +69,11 @@ fn measure(value: &Value) -> (usize, usize) {
     walk(value, 0)
 }
 
+/// The non-empty, trimmed items of a comma-separated list.
+fn list(text: &str) -> impl Iterator<Item = &str> {
+    text.split(',').map(str::trim).filter(|item| !item.is_empty())
+}
+
 /// `hint` is a file name, a format name, or empty to sniff the text.
 fn resolve(hint: &str, text: &str) -> Format {
     Format::from_name(hint)
@@ -103,15 +108,10 @@ pub fn run(
     old_hint: &str,
     new_hint: &str,
     array_keys: &str,
+    ignore_paths: &str,
 ) -> Result<Report, Failure> {
-    let options = DiffOptions {
-        array_keys: array_keys
-            .split(',')
-            .map(str::trim)
-            .filter(|key| !key.is_empty())
-            .map(String::from)
-            .collect(),
-    };
+    let options = list(array_keys).fold(DiffOptions::new(), |o, key| o.array_key(key));
+    let options = list(ignore_paths).fold(options, |o, pattern| o.ignore_path(pattern));
     let total = Clock::start();
     let (old, old_side) = load(old_text, old_hint, "old")?;
     let (new, new_side) = load(new_text, new_hint, "new")?;
@@ -121,11 +121,19 @@ pub fn run(
     let diff_ms = clock.elapsed_ms();
 
     let clock = Clock::start();
-    let tree = tree::build(&old, &new, &options.array_keys);
+    let tree = tree::build(&old, &new, &options);
     let tree_ms = clock.elapsed_ms();
 
     let clock = Clock::start();
-    let roundtrip_ok = patch(old, &deltas).is_ok_and(|patched| patched == new);
+    // Ignored parts keep their old value, so with ignore patterns the check is
+    // that nothing differs outside them.
+    let roundtrip_ok = patch(old, &deltas).is_ok_and(|patched| {
+        if options.ignore_paths.is_empty() {
+            patched == new
+        } else {
+            diff_with(&new, &patched, &options).is_empty()
+        }
+    });
     let patch_ms = clock.elapsed_ms();
 
     let mut by_op = BTreeMap::new();
@@ -159,8 +167,15 @@ pub fn run(
 /// Diffs two documents and returns a JSON string: a [`Report`], or a
 /// [`Failure`] (`ok: false`) if either input does not parse.
 #[wasm_bindgen]
-pub fn run_diff(old: &str, new: &str, old_hint: &str, new_hint: &str, array_keys: &str) -> String {
-    let result = match run(old, new, old_hint, new_hint, array_keys) {
+pub fn run_diff(
+    old: &str,
+    new: &str,
+    old_hint: &str,
+    new_hint: &str,
+    array_keys: &str,
+    ignore_paths: &str,
+) -> String {
+    let result = match run(old, new, old_hint, new_hint, array_keys, ignore_paths) {
         Ok(report) => serde_json::to_string(&report),
         Err(failure) => serde_json::to_string(&failure),
     };
@@ -186,7 +201,7 @@ mod tests {
     #[test]
     fn reports_operations_and_metrics() {
         let report =
-            run(r#"{"a":1,"b":[1,2]}"#, r#"{"a":2,"b":[1],"c":true}"#, "", "", "").unwrap();
+            run(r#"{"a":1,"b":[1,2]}"#, r#"{"a":2,"b":[1],"c":true}"#, "", "", "", "").unwrap();
         assert_eq!(report.metrics.operations, 3);
         assert_eq!(report.metrics.by_op["replace"], 1);
         assert!(report.metrics.roundtrip_ok);
@@ -196,15 +211,36 @@ mod tests {
     }
 
     #[test]
+    fn ignored_paths_are_left_out_of_the_operations_and_marked_in_the_tree() {
+        let (old, new) = (
+            r#"{"a": 1, "stamp": 1, "n": {"seen": 1, "k": 1}, "gone": 1}"#,
+            r#"{"a": 2, "stamp": 9, "n": {"seen": 2, "k": 2}, "fresh": 1}"#,
+        );
+        let report = run(old, new, "", "", "", " /stamp , /**/seen, /gone ,/fresh").unwrap();
+        let paths: Vec<_> =
+            report.operations.iter().map(|o| o["path"].as_str().unwrap().to_string()).collect();
+        assert_eq!(paths, ["/a", "/n/k"]);
+        assert_eq!(report.metrics.operations, 2);
+        assert!(report.metrics.roundtrip_ok);
+        let ignored = |key: &str| {
+            report.tree.children.iter().find(|c| c.key.as_deref() == Some(key)).unwrap().status
+        };
+        for key in ["stamp", "gone", "fresh"] {
+            assert_eq!(ignored(key), tree::Status::Ignored, "{key}");
+        }
+        assert_eq!(tree::changed_nodes(&report.tree), 2);
+    }
+
+    #[test]
     fn mixed_formats_can_be_compared() {
-        let report = run("a: 1\n", r#"{"a": 2}"#, "x.yaml", "", "").unwrap();
+        let report = run("a: 1\n", r#"{"a": 2}"#, "x.yaml", "", "", "").unwrap();
         assert_eq!(report.metrics.old.format, "yaml");
         assert_eq!(report.metrics.operations, 1);
     }
 
     #[test]
     fn parse_failure_names_the_side() {
-        let failure = run("{}", "{", "", "json", "").err().unwrap();
+        let failure = run("{}", "{", "", "json", "", "").err().unwrap();
         assert_eq!(failure.side, "new");
         assert!(failure.error.contains("json"));
     }
@@ -212,8 +248,7 @@ mod tests {
     #[test]
     fn keyed_tree_matches_operations() {
         use drift::Operation;
-        let keys = vec!["id".to_string()];
-        let options = DiffOptions { array_keys: keys.clone() };
+        let options = DiffOptions::new().array_key("id");
         let cases = [
             (
                 json!([{"id": 1, "v": 1}, {"id": 2, "v": 2}]),
@@ -229,7 +264,7 @@ mod tests {
             let ops = diff_with(&new, &old, &options);
             let changes = ops.iter().filter(|d| d.op != Operation::Move).count();
             let moves = ops.len() - changes;
-            let tree = tree::build(&old, &new, &keys);
+            let tree = tree::build(&old, &new, &options);
             assert_eq!(tree::changed_nodes(&tree), changes, "{old} -> {new}");
             assert_eq!(tree::moved_nodes(&tree), moves, "{old} -> {new}");
         }
@@ -248,15 +283,18 @@ mod tests {
         ];
         for (old, new) in cases {
             let ops = drift::diff(&new, &old);
-            let tree = tree::build(&old, &new, &[]);
+            let tree = tree::build(&old, &new, &DiffOptions::new());
             assert_eq!(tree::changed_nodes(&tree), ops.len(), "{old} -> {new}");
         }
     }
 
     #[test]
     fn unchanged_subtrees_are_collapsed() {
-        let tree =
-            tree::build(&json!({"a": {"x": 1}, "b": 1}), &json!({"a": {"x": 1}, "b": 2}), &[]);
+        let tree = tree::build(
+            &json!({"a": {"x": 1}, "b": 1}),
+            &json!({"a": {"x": 1}, "b": 2}),
+            &DiffOptions::new(),
+        );
         let a = &tree.children[0];
         assert_eq!(a.status, tree::Status::Same);
         assert!(a.children.is_empty());

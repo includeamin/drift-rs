@@ -4,7 +4,7 @@
 //! index. Each changed node corresponds to exactly one RFC 6902 operation, which
 //! the tests check.
 
-use drift::match_array_items;
+use drift::{join_pointer, match_array_items, DiffOptions};
 use serde::Serialize;
 use serde_json::{Map, Value};
 use std::collections::HashSet;
@@ -18,6 +18,8 @@ pub enum Status {
     Changed,
     /// Unchanged itself, but something below it changed.
     Nested,
+    /// Covered by an ignore pattern, so left out of the diff whatever differs.
+    Ignored,
 }
 
 #[derive(Serialize, Debug)]
@@ -59,35 +61,50 @@ impl Node {
     }
 }
 
-/// `array_keys` must be the same ones given to [`drift::diff_with`], so the tree
-/// pairs array items exactly like the operations do.
-pub fn build(old: &Value, new: &Value, array_keys: &[String]) -> Node {
-    node(None, old, new, array_keys)
+/// `options` must be the ones given to [`drift::diff_with`], so the tree pairs
+/// array items and skips ignored parts exactly like the operations do.
+pub fn build(old: &Value, new: &Value, options: &DiffOptions) -> Node {
+    node(None, "", old, new, options)
 }
 
-fn node(key: Option<String>, old: &Value, new: &Value, keys: &[String]) -> Node {
+fn node(key: Option<String>, path: &str, old: &Value, new: &Value, options: &DiffOptions) -> Node {
     if old == new {
         // Unchanged subtrees stay collapsed: one value, no children.
         return Node::leaf(key, Status::Same, None, Some(new));
     }
+    if options.ignores(path) {
+        return Node::leaf(key, Status::Ignored, Some(old), Some(new));
+    }
+    let keys = &options.array_keys[..];
     let container = if new.is_array() { "array" } else { "object" };
     let children = match (old, new) {
         (Value::Object(o), Value::Object(n)) => merged_keys(o, n)
             .into_iter()
-            .map(|k| match (o.get(k), n.get(k)) {
-                (Some(a), Some(b)) => node(Some(k.clone()), a, b, keys),
-                (Some(a), None) => Node::leaf(Some(k.clone()), Status::Removed, Some(a), None),
-                (None, Some(b)) => Node::leaf(Some(k.clone()), Status::Added, None, Some(b)),
-                (None, None) => unreachable!(),
+            .map(|k| {
+                let member = join_pointer(path, k);
+                match (o.get(k), n.get(k)) {
+                    (Some(a), Some(b)) => node(Some(k.clone()), &member, a, b, options),
+                    // Added or removed members under an ignore pattern are not reported.
+                    (Some(a), None) if options.ignores(&member) => {
+                        Node::leaf(Some(k.clone()), Status::Ignored, Some(a), None)
+                    }
+                    (None, Some(b)) if options.ignores(&member) => {
+                        Node::leaf(Some(k.clone()), Status::Ignored, None, Some(b))
+                    }
+                    (Some(a), None) => Node::leaf(Some(k.clone()), Status::Removed, Some(a), None),
+                    (None, Some(b)) => Node::leaf(Some(k.clone()), Status::Added, None, Some(b)),
+                    (None, None) => unreachable!(),
+                }
             })
             .collect(),
         (Value::Array(o), Value::Array(n)) => match match_array_items(n, o, keys) {
-            Some(matches) => keyed_children(o, n, &matches, keys),
+            Some(matches) => keyed_children(o, n, &matches, path, options),
             None => (0..o.len().max(n.len()))
                 .map(|i| {
                     let key = Some(i.to_string());
+                    let item = join_pointer(path, &i.to_string());
                     match (o.get(i), n.get(i)) {
-                        (Some(a), Some(b)) => node(key, a, b, keys),
+                        (Some(a), Some(b)) => node(key, &item, a, b, options),
                         (Some(a), None) => Node::leaf(key, Status::Removed, Some(a), None),
                         (None, Some(b)) => Node::leaf(key, Status::Added, None, Some(b)),
                         (None, None) => unreachable!(),
@@ -132,7 +149,8 @@ fn keyed_children(
     old: &[Value],
     new: &[Value],
     matches: &[Option<usize>],
-    keys: &[String],
+    path: &str,
+    options: &DiffOptions,
 ) -> Vec<Node> {
     let matched: HashSet<usize> = matches.iter().flatten().copied().collect();
     // Replays the placement drift::diff_with performs, to know which items get a `move`.
@@ -145,7 +163,8 @@ fn keyed_children(
             Some(old_index) => {
                 let from =
                     current.iter().position(|&slot| slot == Some(old_index)).unwrap_or(index);
-                let mut child = node(key, &old[old_index], item, keys);
+                let item_path = join_pointer(path, &index.to_string());
+                let mut child = node(key, &item_path, &old[old_index], item, options);
                 child.old_index = Some(old_index);
                 if from != index {
                     let slot = current.remove(from);
@@ -170,7 +189,7 @@ fn keyed_children(
 pub fn changed_nodes(node: &Node) -> usize {
     match node.status {
         Status::Added | Status::Removed | Status::Changed => 1,
-        Status::Same => 0,
+        Status::Same | Status::Ignored => 0,
         Status::Nested => node.children.iter().map(changed_nodes).sum(),
     }
 }
@@ -194,6 +213,9 @@ mod tests {
         let old = json!({"zebra": 1, "gone": 1, "apple": 1});
         let new = json!({"zebra": 2, "apple": 1, "fresh": 1});
         // `gone` stays right after `zebra`, where it was; `fresh` is last, as in the new document.
-        assert_eq!(keys(&build(&old, &new, &[])), ["zebra", "gone", "apple", "fresh"]);
+        assert_eq!(
+            keys(&build(&old, &new, &DiffOptions::new())),
+            ["zebra", "gone", "apple", "fresh"]
+        );
     }
 }

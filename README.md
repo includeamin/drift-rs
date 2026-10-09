@@ -138,7 +138,7 @@ drift diff --array-key id old.json new.json   # repeatable; first usable key win
 ```rust
 use drift::{diff_with, DiffOptions};
 
-let options = DiffOptions { array_keys: vec!["id".into()] };
+let options = DiffOptions::new().array_key("id");
 let operations = diff_with(&new, &old, &options);
 ```
 
@@ -147,6 +147,35 @@ a unique string, number or boolean value for it; otherwise that array falls
 back to positional comparison. An insert or delete is then one operation, and a
 reordering produces `move` operations. `--array-key` loads both documents into
 memory; the streaming paths for very large files stay positional.
+
+## Ignoring parts of a document
+
+Timestamps, request ids and other noise can be left out of the diff:
+
+```bash
+drift diff --ignore-path '/**/updatedAt' --ignore-path /meta old.json new.json
+```
+
+```rust
+use drift::{diff_with, DiffOptions};
+
+let options = DiffOptions::new().ignore_path("/**/updatedAt").ignore_path("/meta");
+let operations = diff_with(&new, &old, &options);
+```
+
+Patterns are JSON Pointers where `*` matches one token and `**` any number
+(including none), so `/users/*/lastSeen` covers that member of every user. An
+ignored part is skipped, not filtered afterwards: nothing under it is compared,
+and whether it was added, removed or changed is not reported. Patching with the
+result leaves those parts as they were in the old document.
+
+Adding or removing an array *item* is always reported, even when a pattern
+covers it, because skipping it would shift the indices of the operations after
+it; such a pattern ignores changes *inside* the item. `--ignore-path` loads both
+documents into memory, like `--array-key`.
+
+`DiffOptions` is `#[non_exhaustive]`: build it with `DiffOptions::new()` and its
+methods rather than a struct literal, so new options never break callers.
 
 ## Format notes
 

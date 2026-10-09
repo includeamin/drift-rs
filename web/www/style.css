@@ -134,4 +134,7 @@ pre.raw { margin: 0; background: var(--surface); border: 1px solid var(--line); 
 }
 
 input.keys { font: 13px var(--code); padding: 5px 8px; width: 150px; color: var(--ink); background: var(--surface); border: 1px solid var(--line); border-radius: 8px; }
+input.keys.wide { width: 210px; }
+.chip.ignored { background: color-mix(in srgb, var(--line) 60%, transparent); color: var(--muted); }
+.cell.ignored { color: var(--muted); background: color-mix(in srgb, var(--line) 35%, transparent); border-left-color: var(--muted); font-style: italic; }
 .cell .moved { opacity: .7; font-style: italic; }

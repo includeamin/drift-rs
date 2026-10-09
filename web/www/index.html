@@ -66,6 +66,9 @@
     <label class="check" title="Match array items by these fields (comma-separated) instead of by position">Array key
       <input type="text" id="array-keys" class="keys" placeholder="e.g. id, name" spellcheck="false" autocomplete="off">
     </label>
+    <label class="check" title="Leave these parts out of the diff (comma-separated JSON Pointers; * is one token, ** any number)">Ignore
+      <input type="text" id="ignore-paths" class="keys wide" placeholder="e.g. /updatedAt, /**/id" spellcheck="false" autocomplete="off">
+    </label>
   </div>
 
   <div id="error" class="error" role="alert" hidden></div>
@@ -84,7 +87,7 @@
     <div class="tabpanel" id="tab-visual">
       <div class="toolbar">
         <div class="legend">
-          <span class="chip added">added</span><span class="chip removed">removed</span><span class="chip changed">changed</span>
+          <span class="chip added">added</span><span class="chip removed">removed</span><span class="chip changed">changed</span><span class="chip ignored" id="legend-ignored" hidden>ignored</span>
         </div>
         <label class="check"><input type="checkbox" id="show-same"> Expand unchanged</label>
       </div>

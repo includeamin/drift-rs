@@ -117,6 +117,26 @@ fast = []
 `, hint: "new.json" },
   },
   {
+    name: "JSON · ignore noisy fields (Ignore: /**/updatedAt, /meta)",
+    ignore: "/**/updatedAt, /meta",
+    old: { text: `{
+  "meta": { "requestId": "a1", "servedBy": "web-1" },
+  "orders": [
+    { "id": 1, "status": "open", "updatedAt": "2026-10-01T09:00:00Z" },
+    { "id": 2, "status": "open", "updatedAt": "2026-10-01T09:05:00Z" }
+  ]
+}
+`, hint: "old.json" },
+    new: { text: `{
+  "meta": { "requestId": "b7", "servedBy": "web-4" },
+  "orders": [
+    { "id": 1, "status": "shipped", "updatedAt": "2026-10-08T14:30:00Z" },
+    { "id": 2, "status": "open", "updatedAt": "2026-10-08T14:31:00Z" }
+  ]
+}
+`, hint: "new.json" },
+  },
+  {
     name: "Cross-format · YAML vs JSON",
     old: { text: `server:
   host: localhost

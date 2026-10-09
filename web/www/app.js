@@ -60,6 +60,7 @@ for (const side of ["old", "new"]) {
 }
 
 $("array-keys").addEventListener("input", () => scheduleLive());
+$("ignore-paths").addEventListener("input", () => scheduleLive());
 
 const scheduleLive = debounce(() => { if ($("live").checked) compute(); }, 350);
 
@@ -71,6 +72,7 @@ select.addEventListener("change", () => {
   setText("old", ex.old.text, ex.old.hint);
   setText("new", ex.new.text, ex.new.hint);
   $("array-keys").value = ex.keys ?? "";
+  $("ignore-paths").value = ex.ignore ?? "";
   compute();
 });
 
@@ -92,7 +94,7 @@ function compute() {
   const started = performance.now();
   let result;
   try {
-    result = JSON.parse(run_diff(oldText, newText, hintFor("old"), hintFor("new"), $("array-keys").value));
+    result = JSON.parse(run_diff(oldText, newText, hintFor("old"), hintFor("new"), $("array-keys").value, $("ignore-paths").value));
   } catch (err) {
     showError(`Unexpected failure: ${err}`);
     return;
@@ -145,7 +147,8 @@ function renderMetrics(m) {
   const mbps = (m.old.bytes + m.new.bytes) / 1048576 / (m.diff_ms / 1000 || Infinity);
   box.append(metric("Throughput", Number.isFinite(mbps) ? [mbps.toFixed(1), "MB/s"] : "—", "diff step only"));
   box.append(metric("Formats", `${m.old.format} → ${m.new.format}`, m.old.format !== m.new.format ? "cross-format comparison" : "same format"));
-  box.append(metric("Patch check", m.roundtrip_ok ? "✓ verified" : "✗ failed", `apply in ${fmtMs(m.patch_ms)}`, m.roundtrip_ok ? "ok" : "bad"));
+  const ignoring = $("ignore-paths").value.trim() ? " · ignored parts excluded" : "";
+  box.append(metric("Patch check", m.roundtrip_ok ? "✓ verified" : "✗ failed", `apply in ${fmtMs(m.patch_ms)}${ignoring}`, m.roundtrip_ok ? "ok" : "bad"));
   box.append(metric("Render", fmtMs(m.render_ms), `round-trip to WASM ${fmtMs(m.roundtrip_ms)}`));
   box.append(metric("WASM module", fmtBytes(state.wasmBytes), `drift ${m.version}`));
 }
@@ -168,6 +171,8 @@ function render() {
   // A run of in-place replacements inside an array is the signature of a shifted insertion.
   const shifted = operations.filter((o) => o.op === "replace" && /\/\d+$/.test(o.path)).length;
   $("array-note").hidden = shifted < 2;
+  const hasIgnored = (n) => n.status === "ignored" || (n.children ?? []).some(hasIgnored);
+  $("legend-ignored").hidden = !hasIgnored(tree);
   renderVisual(tree);
   renderOps();
   renderRaw();
@@ -268,6 +273,12 @@ function renderVisual(root) {
       case "same": return sameRow(node, depth, labels, comma);
       case "added": return sideBySide([], valueLines(node.new, labels.new, depth, comma), "", "added", "", "+");
       case "removed": return sideBySide(valueLines(node.old, labels.old, depth, comma), [], "removed", "", "−", "");
+      case "ignored": {
+        // Shown for context but not part of the diff; either side may be missing.
+        const oldLines = node.old === undefined ? [] : valueLines(node.old, labels.old, depth, comma);
+        const newLines = node.new === undefined ? [] : valueLines(node.new, labels.new, depth, comma);
+        return sideBySide(oldLines, newLines, "ignored", "ignored", "⊘", "⊘");
+      }
       case "changed":
         return sideBySide(valueLines(node.old, labels.old, depth, comma), valueLines(node.new, labels.new, depth, comma), "changed", "changed", "~", "~");
       case "nested": {

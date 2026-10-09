@@ -8,21 +8,21 @@ use serde_json::Value;
 /// `/users/*/name` matches `/users/0/name`, and `/a/**` matches `/a` and
 /// everything under it.
 pub fn path_matches(pattern: &str, path: &str) -> Result<bool, DriftError> {
-    let pattern = split_pointer(pattern)?;
-    let path = split_pointer(path)?;
-    fn go(pattern: &[String], path: &[String]) -> bool {
-        if pattern.is_empty() {
-            return path.is_empty();
+    Ok(glob_match(&split_pointer(pattern)?, &split_pointer(path)?))
+}
+
+/// Matches the tokens of a path against the tokens of a glob pattern.
+pub(crate) fn glob_match<P: AsRef<str>, T: AsRef<str>>(pattern: &[P], path: &[T]) -> bool {
+    match pattern.split_first() {
+        None => path.is_empty(),
+        Some((first, rest)) if first.as_ref() == "**" => {
+            (0..=path.len()).any(|skip| glob_match(rest, &path[skip..]))
         }
-        if pattern[0] == "**" {
-            (0..=path.len()).any(|i| go(&pattern[1..], &path[i..]))
-        } else {
-            !path.is_empty()
-                && (pattern[0] == "*" || pattern[0] == path[0])
-                && go(&pattern[1..], &path[1..])
-        }
+        Some((first, rest)) => path.split_first().is_some_and(|(token, remaining)| {
+            (first.as_ref() == "*" || first.as_ref() == token.as_ref())
+                && glob_match(rest, remaining)
+        }),
     }
-    Ok(go(&pattern, &path))
 }
 
 fn get<'a>(document: &'a Value, path: &str) -> Option<&'a Value> {
@@ -150,7 +150,7 @@ mod tests {
         // After the front insert, "b" sits at /2 in the new array but /1 in the old one.
         let old = json!([{"id": 1, "v": "a"}, {"id": 2, "v": "b"}]);
         let new = json!([{"id": 0, "v": "z"}, {"id": 1, "v": "a"}, {"id": 2, "v": "B"}]);
-        let options = DiffOptions { array_keys: vec!["id".into()] };
+        let options = DiffOptions::new().array_key("id");
         let ops = diff_with(&new, &old, &options);
         let kept =
             filter_operations(&ops, Some(&old), &[], &[], &["\"b\"".into()], &[], false).unwrap();
