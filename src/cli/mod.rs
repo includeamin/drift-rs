@@ -127,21 +127,6 @@ fn write_output(
     Ok(())
 }
 
-fn delta_json(delta: &Delta) -> Value {
-    let mut map = serde_json::Map::new();
-    map.insert("op".into(), Value::String(delta.op.as_str().into()));
-    map.insert("path".into(), Value::String(delta.path.clone()));
-    if let Some(value) = &delta.value {
-        if matches!(delta.op, Operation::Add | Operation::Replace | Operation::Test) {
-            map.insert("value".into(), value.clone());
-        }
-    }
-    if let Some(from) = &delta.from_path {
-        map.insert("from".into(), Value::String(from.clone()));
-    }
-    Value::Object(map)
-}
-
 /// Operations per type, with types in alphabetical order so the output is stable.
 fn op_counts(operations: &[Delta]) -> Value {
     let mut counts = std::collections::BTreeMap::new();
@@ -206,7 +191,7 @@ fn cmd_diff(args: DiffArgs) -> Result<i32, Box<dyn std::error::Error>> {
             let counts = op_counts(&operations);
             serde_json::json!({"total": operations.len(), "by_op": counts})
         } else {
-            Value::Array(operations.iter().map(delta_json).collect())
+            serde_json::to_value(&operations)?
         };
         write_output(
             if args.output.compact {
@@ -220,24 +205,6 @@ fn cmd_diff(args: DiffArgs) -> Result<i32, Box<dyn std::error::Error>> {
     Ok(if args.exit_code && !operations.is_empty() { 1 } else { 0 })
 }
 
-fn parse_delta(raw: &Value) -> Result<Delta, Box<dyn std::error::Error>> {
-    let op = match raw["op"].as_str().ok_or("missing op")? {
-        "add" => Operation::Add,
-        "remove" => Operation::Remove,
-        "replace" => Operation::Replace,
-        "move" => Operation::Move,
-        "copy" => Operation::Copy,
-        "test" => Operation::Test,
-        _ => return Err("unsupported operation".into()),
-    };
-    Ok(Delta {
-        op,
-        path: raw["path"].as_str().unwrap_or("").into(),
-        value: raw.get("value").cloned(),
-        from_path: raw.get("from").and_then(Value::as_str).map(String::from),
-    })
-}
-
 fn read_patch(path: &str) -> Result<Vec<Delta>, Box<dyn std::error::Error>> {
     let mut text = String::new();
     if path == "-" {
@@ -245,7 +212,7 @@ fn read_patch(path: &str) -> Result<Vec<Delta>, Box<dyn std::error::Error>> {
     } else {
         text = fs::read_to_string(path)?;
     }
-    serde_json::from_str::<Vec<Value>>(&text)?.iter().map(parse_delta).collect::<Result<_, _>>()
+    Ok(serde_json::from_str(&text)?)
 }
 
 fn cmd_patch(args: PatchArgs) -> Result<i32, Box<dyn std::error::Error>> {
