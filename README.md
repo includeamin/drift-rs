@@ -177,6 +177,29 @@ documents into memory, like `--array-key`.
 `DiffOptions` is `#[non_exhaustive]`: build it with `DiffOptions::new()` and its
 methods rather than a struct literal, so new options never break callers.
 
+## Patching files without losing their comments
+
+`drift patch` reads a document, patches the value tree and writes it back.
+Writing the tree out from scratch would drop comments and layout, so for **TOML**
+the original text is edited in place instead: comments, blank lines, key order
+and number or string styles (`1_000`, `0xFF`, `'literal'`) are untouched wherever
+the value did not change, and a changed value keeps the comment after it.
+
+```toml
+port = 8080   # http          drift patch  [replace /port 9090]  ->   port = 9090   # http
+```
+
+Comments follow their own entries when one is removed from a list, including a
+multi-line array with a comment per item and an array of `[[tables]]`. A new
+table is written at the end of the document. The result is checked to read back
+as the patched value, and if it does not (or the original cannot be edited in
+place) the document is written out fresh, which is always correct but drops the
+comments.
+
+The library function is `drift::formats::dump_like(original, &new, format, compact)`.
+**YAML** and **XML** are not preserved yet: they are written fresh, so comments
+in those files are still lost.
+
 ## Format notes
 
 Documents are converted to a JSON value tree, which loses a few things:
