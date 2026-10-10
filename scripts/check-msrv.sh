@@ -20,7 +20,7 @@ sed -i 's/^members = .*/members = ["."]/; /^\[\[bench\]\]/,/^harness/d' Cargo.to
 rustup toolchain install "$msrv" --profile minimal
 CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS=fallback cargo generate-lockfile
 
-for features in "--no-default-features" "--no-default-features --features yaml,toml,xml"; do
+for features in "--no-default-features" "--no-default-features --features yaml,toml,xml" "--no-default-features --features yaml-comments"; do
     echo "== rust $msrv: lib $features"
     cargo "+$msrv" check --locked --lib $features
 done
