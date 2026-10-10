@@ -28,9 +28,11 @@ required-features = ["cli"]
 [features]
 default = ["cli", "yaml", "toml", "xml"]
 # The `drift` binary. Needs every format, since it detects them by extension.
-cli = ["dep:clap", "yaml", "toml", "xml"]
+cli = ["dep:clap", "yaml-comments", "toml", "xml"]
 # Optional document formats for `drift::formats`. JSON is always available.
 yaml = ["dep:serde_yaml"]
+# Keep comments and layout when patching YAML files (see `formats::dump_like`).
+yaml-comments = ["yaml", "dep:yaml-edit"]
 toml = ["dep:toml", "dep:toml_edit"]
 xml = ["dep:roxmltree"]
 
@@ -42,6 +44,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 serde_yaml = { version = "0.9", optional = true }
 toml = { version = "0.8", features = ["preserve_order"], optional = true }
+# Lossless YAML syntax tree, for editing a document without losing its comments.
+yaml-edit = { version = "0.3", default-features = false, optional = true }
 # Edits a parsed document in place, keeping comments and formatting. Already a
 # dependency of `toml`; the version is the one it uses.
 toml_edit = { version = "0.22", optional = true }

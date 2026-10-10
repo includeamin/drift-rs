@@ -154,8 +154,18 @@ pub fn dump_with(
 /// cannot be edited in place, the document is written out fresh as [`dump_with`]
 /// does, which is always correct but drops the comments.
 ///
-/// Every other format is written fresh. JSON has no comments to keep; YAML and
-/// XML do, but are not preserved yet.
+/// YAML is edited in place too, with the `yaml-comments` feature: comments after
+/// values and in front of keys survive changes to values, added keys and
+/// removed keys. The editing library is less dependable than TOML's, so the
+/// result is checked the same way, and these are the limits:
+///
+/// - a new list or mapping is written in flow style (`{a: 1, b: [x, y]}`);
+/// - a comment belonging to a removed entry may be left behind as a stray line;
+/// - if adding or removing items of a list cannot be done in place, that list is
+///   replaced whole, and the comments inside it are lost.
+///
+/// Everything else is written fresh: JSON has no comments to keep, and XML is
+/// not preserved yet.
 ///
 /// ```
 /// # #[cfg(feature = "toml")]
@@ -195,6 +205,11 @@ fn edit_in_place(original: &str, new: &Value, format: Format) -> Option<String> 
         let text = toml_preserve::edit(original, new).ok()?;
         return (parse(&text, Format::Toml).ok().as_ref() == Some(new)).then_some(text);
     }
+    #[cfg(feature = "yaml-comments")]
+    if format == Format::Yaml {
+        // `edit` has already checked that the text reads back as `new`.
+        return yaml_preserve::edit(original, new).ok();
+    }
     let _ = (original, new, format);
     None
 }
@@ -231,6 +246,8 @@ fn disabled(name: &str, feature: &str) -> String {
     format!("{name} support is not compiled in; enable the `{feature}` feature")
 }
 
+#[cfg(any(feature = "toml", feature = "yaml-comments"))]
+mod align;
 #[cfg(feature = "toml")]
 mod toml_fmt;
 #[cfg(feature = "toml")]
@@ -239,6 +256,8 @@ mod toml_preserve;
 mod xml_fmt;
 #[cfg(feature = "yaml")]
 mod yaml_fmt;
+#[cfg(feature = "yaml-comments")]
+mod yaml_preserve;
 
 format_adapters!("yaml", yaml_fmt, "YAML"; yaml(), yaml_dump());
 format_adapters!("toml", toml_fmt, "TOML"; toml(hints: &mut Hints), toml_dump(hints: &Hints));
@@ -462,5 +481,23 @@ mod tests {
                 dump(&value, format, false).unwrap()
             );
         }
+    }
+
+    #[test]
+    #[cfg(feature = "yaml-comments")]
+    fn dump_like_keeps_a_yaml_documents_comments_and_layout() {
+        let original = "# top\nname: x   # who\nport: 80\n\ndb:\n  url: u   # where\n";
+        let mut value = parse(original, Format::Yaml).unwrap();
+        value["port"] = serde_json::json!(81);
+        let out = dump_like(original, &value, Format::Yaml, false).unwrap();
+        assert_eq!(out, original.replace("port: 80", "port: 81"));
+    }
+
+    #[test]
+    #[cfg(feature = "yaml-comments")]
+    fn dump_like_falls_back_to_a_plain_write_for_yaml_it_cannot_edit_in_place() {
+        // A mapping cannot become a list in place; the plain writer handles it.
+        let out = dump_like("a: 1\n", &serde_json::json!([1, 2]), Format::Yaml, false).unwrap();
+        assert_eq!(parse(&out, Format::Yaml).unwrap(), serde_json::json!([1, 2]));
     }
 }

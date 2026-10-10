@@ -38,6 +38,7 @@ jobs:
           - "--no-default-features --features yaml"
           - "--no-default-features --features toml"
           - "--no-default-features --features xml"
+          - "--no-default-features --features yaml-comments"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

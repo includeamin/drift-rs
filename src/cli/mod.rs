@@ -338,4 +338,21 @@ mod tests {
         assert_eq!(fs::read_to_string(&file).unwrap(), patched);
         fs::remove_dir_all(&dir).ok();
     }
+
+    #[test]
+    fn patching_a_yaml_file_in_place_keeps_its_comments_and_does_not_grow() {
+        let dir = std::env::temp_dir().join(format!("drift-cli-yaml-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("config.yaml");
+        let original = "# service\nname: x   # who\nreplicas: 2\n\nimage:\n  tag: v1   # pinned\n";
+        fs::write(&file, original).unwrap();
+
+        run_patch(&file, r#"[{"op": "replace", "path": "/image/tag", "value": "v2"}]"#);
+        let patched = fs::read_to_string(&file).unwrap();
+        assert_eq!(patched, original.replace("tag: v1", "tag: v2"));
+
+        run_patch(&file, r#"[{"op": "test", "path": "/replicas", "value": 2}]"#);
+        assert_eq!(fs::read_to_string(&file).unwrap(), patched);
+        fs::remove_dir_all(&dir).ok();
+    }
 }

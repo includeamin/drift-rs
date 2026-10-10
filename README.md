@@ -112,7 +112,8 @@ between that document and the patched one.
 | Feature | Enables |
 |---------|---------|
 | `yaml`, `toml`, `xml` | Reading and writing that format in `drift::formats` (JSON is always available) |
-| `cli` | The `drift` binary (implies the three formats) |
+| `yaml-comments` | Keeping comments when patching YAML (implies `yaml`; needs `yaml-edit`) |
+| `cli` | The `drift` binary (implies the three formats and `yaml-comments`) |
 
 All are on by default. A library user who only needs JSON can drop the rest,
 which also drops `serde_yaml`, `toml`, `roxmltree` and `clap` from the build:
@@ -196,9 +197,26 @@ as the patched value, and if it does not (or the original cannot be edited in
 place) the document is written out fresh, which is always correct but drops the
 comments.
 
+**YAML** is edited in place as well (feature `yaml-comments`, on by default): the
+comments after values and in front of keys survive changed values, added keys and
+removed keys, and untouched lines come out byte for byte. On a commented
+Kubernetes manifest, five patch operations changed exactly five lines and all
+eight comments survived. The library behind it is younger and less dependable
+than the TOML one, so YAML has a few more limits:
+
+- a new list or mapping is written in flow style (`labels: {team: core}`), which
+  is valid YAML on one line;
+- the comment of a removed entry can be left behind as a stray line;
+- adding or removing items of a list is done in place where the library copes
+  with the layout, and otherwise the list is replaced whole, which loses the
+  comments *inside that list* (nothing else is affected);
+- after every edit the result is read back, and if it differs from the patched
+  value the document is written out fresh, which is correct but drops the
+  comments. That happened for about 3% of 500 random multi-part edits.
+
 The library function is `drift::formats::dump_like(original, &new, format, compact)`.
-**YAML** and **XML** are not preserved yet: they are written fresh, so comments
-in those files are still lost.
+**XML** is not preserved yet: it is written fresh, so comments in XML files are
+still lost.
 
 ## Format notes
 
