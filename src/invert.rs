@@ -231,7 +231,7 @@ mod tests {
 
     #[test]
     fn inverts_keyed_array_diffs_with_moves() {
-        let options = DiffOptions { array_keys: vec!["id".into()] };
+        let options = DiffOptions::new().array_key("id");
         let old = json!({"l": [{"id": 1, "v": 1}, {"id": 2, "v": 2}, {"id": 3, "v": 3}]});
         let new = json!({"l": [{"id": 3, "v": 3}, {"id": 0, "v": 0}, {"id": 1, "v": 9}]});
         let operations = diff_with(&new, &old, &options);
@@ -249,7 +249,7 @@ mod tests {
             state ^= state << 17;
             state % n
         };
-        let options = DiffOptions { array_keys: vec!["id".into()] };
+        let options = DiffOptions::new().array_key("id");
         for _ in 0..400 {
             let doc = |next: &mut dyn FnMut(u64) -> u64| {
                 let mut ids: Vec<u64> = (0..6).filter(|_| next(2) == 0).collect();
