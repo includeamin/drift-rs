@@ -59,6 +59,8 @@ drift diff OLD NEW
 drift patch DOCUMENT PATCH
 drift paths DOCUMENT
 drift check OLD NEW
+drift invert DOCUMENT PATCH
+drift compose DOCUMENT PATCH...
 ```
 
 JSON, YAML, TOML, and XML documents are supported. The format is detected from
@@ -68,6 +70,17 @@ the file extension or selected with `--format`. Use `-` for stdin and
 `diff` supports `--stats`, `--pretty`, `--exit-code`, `--path`, `--field`,
 `--grep`, `--op`, and `--invert-match`. `paths` supports `--values`,
 `--containers`, `--include-root`, `--sort-keys`, `--max-depth`, and `--json`.
+
+`invert` prints the patch that undoes `PATCH` when it is applied to `DOCUMENT`,
+so a change can be rolled back; `compose` squashes several patches, applied in
+the order given, into one equivalent patch (`--array-key` as for `diff`). Both
+need the document the patch applies to, and the patch must apply cleanly.
+
+```bash
+drift invert config.yaml change.json -o undo.json   # first, while config.yaml is unchanged
+drift patch config.yaml change.json --in-place      # apply the change
+drift patch config.yaml undo.json --in-place        # later: roll it back
+```
 
 ## Library
 
@@ -252,22 +265,27 @@ pick a strategy. When either file is larger than 32 MB:
 Anything else is loaded normally.
 
 Both paths emit **exactly the same operations, in the same order**. The choice
-only affects peak memory, not speed — the work done is the same.
+affects peak memory, and in these runs streaming was also somewhat faster.
 
 | Input | Standard | Streaming |
 |-------|----------|-----------|
-| 47.5 MB array of 400k objects | 735 MB | 7.6 MB |
-| 36.9 MB `{"users": [600k], "meta": {}}` | 995 MB | 7 MB |
-| 36.9 MB `{"response": {"payload": {"users": [600k]}}}` | 995 MB | 7 MB |
+| 48 MB array of 400k objects | 1.27 GB | 18 MB |
+| 36.9 MB `{"users": [600k], "meta": {}}` | 1.29 GB | 19 MB |
+| 36.9 MB `{"response": {"payload": {"users": [600k]}}}` | 1.29 GB | 21 MB |
 
-Peak memory for the in-memory path runs 15-27x the file size, because a
+Peak memory for the in-memory path runs 26-35x the file size, because a
 `serde_json::Value` tree is much larger than its serialized form. The streaming
-path stays flat regardless of input size.
+path stays flat regardless of input size, at about 20 MB (an idle `drift`
+process is about 4 MB).
 
-The table was measured before objects kept their key order. Preserving order
-costs the in-memory path about a third more memory (a 36 MB array of 400k
-objects: 857 MB before, 1,157 MB now) at about the same speed; streaming is
-unchanged.
+Measured as the process's own peak memory with the release binary, on generated
+files of those shapes (old and new differing in every 50th object); the standard
+path reads the second document from stdin, which forces it into memory. It takes
+roughly 3 s against 2-3 s for streaming on this machine, so timings are close and
+vary from run to run. Keeping key order made the standard path use about 30% more
+memory and take 20-30% longer than before (965 MB and 2.7 s on the array);
+streaming is unchanged. An earlier version of this table listed 7 MB for
+streaming, which does not reproduce.
 
 ```rust
 use drift::diff_files;
