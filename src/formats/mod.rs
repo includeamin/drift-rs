@@ -143,6 +143,62 @@ pub fn dump_with(
     }
 }
 
+/// Writes `new` as `format`, keeping as much as it can of how `original` was
+/// written.
+///
+/// `original` is the text `new` was derived from, normally by reading it and
+/// patching the result. For TOML the original is edited in place: comments,
+/// blank lines, key order and number or string styles survive wherever the
+/// value did not change, and a changed value keeps the comment after it. The
+/// result is checked to read back as `new`; if it does not, or the original
+/// cannot be edited in place, the document is written out fresh as [`dump_with`]
+/// does, which is always correct but drops the comments.
+///
+/// Every other format is written fresh. JSON has no comments to keep; YAML and
+/// XML do, but are not preserved yet.
+///
+/// ```
+/// # #[cfg(feature = "toml")]
+/// # {
+/// use drift::formats::{dump_like, parse, Format};
+///
+/// let original = "port = 80  # http\nhost = \"a\"\n";
+/// let mut value = parse(original, Format::Toml)?;
+/// value["port"] = 8080.into();
+/// assert_eq!(
+///     dump_like(original, &value, Format::Toml, false)?,
+///     "port = 8080  # http\nhost = \"a\"\n"
+/// );
+/// # }
+/// # Ok::<(), drift::DriftError>(())
+/// ```
+pub fn dump_like(
+    original: &str,
+    new: &Value,
+    format: Format,
+    compact: bool,
+) -> Result<String, DriftError> {
+    if let Some(text) = edit_in_place(original, new, format) {
+        return Ok(text);
+    }
+    let hints = parse_with(original, format, &ParseOptions::default())
+        .map(|(_, hints)| hints)
+        .unwrap_or_default();
+    dump_with(new, format, compact, &hints)
+}
+
+/// `original` edited to hold `new`, when the format supports it and the result
+/// reads back as `new`.
+fn edit_in_place(original: &str, new: &Value, format: Format) -> Option<String> {
+    #[cfg(feature = "toml")]
+    if format == Format::Toml {
+        let text = toml_preserve::edit(original, new).ok()?;
+        return (parse(&text, Format::Toml).ok().as_ref() == Some(new)).then_some(text);
+    }
+    let _ = (original, new, format);
+    None
+}
+
 // One adapter per optional format: the real one with its feature on, otherwise
 // an error that says which feature to enable.
 macro_rules! format_adapters {
@@ -177,6 +233,8 @@ fn disabled(name: &str, feature: &str) -> String {
 
 #[cfg(feature = "toml")]
 mod toml_fmt;
+#[cfg(feature = "toml")]
+mod toml_preserve;
 #[cfg(feature = "xml")]
 mod xml_fmt;
 #[cfg(feature = "yaml")]
@@ -364,5 +422,45 @@ mod tests {
         assert!(message.contains("recursion limit"), "{message}");
         // Far past what the stack could hold; must fail cleanly.
         assert!(parse(&nested(200_000), Format::Xml).is_err());
+    }
+
+    #[test]
+    #[cfg(feature = "toml")]
+    fn dump_like_keeps_a_toml_documents_comments_and_layout() {
+        let original = "# top\nname = \"x\"  # who\nport = 80\n\n[db]\nurl = 'u'  # where\n";
+        let mut value = parse(original, Format::Toml).unwrap();
+        value["port"] = serde_json::json!(81);
+        let out = dump_like(original, &value, Format::Toml, false).unwrap();
+        assert_eq!(out, original.replace("port = 80", "port = 81"));
+    }
+
+    #[test]
+    #[cfg(feature = "toml")]
+    fn dump_like_falls_back_to_a_plain_write_for_what_cannot_be_edited_in_place() {
+        // A root that is not an object cannot be edited in place; the error is the plain writer's.
+        let error = dump_like("a = 1\n", &serde_json::json!([1]), Format::Toml, false);
+        assert!(error.is_err());
+        // Text that is not valid TOML is written out fresh rather than failing.
+        let out =
+            dump_like("not = = toml", &serde_json::json!({"a": 1}), Format::Toml, false).unwrap();
+        assert_eq!(parse(&out, Format::Toml).unwrap(), serde_json::json!({"a": 1}));
+    }
+
+    #[test]
+    fn dump_like_is_a_plain_write_for_formats_that_keep_no_layout() {
+        let value = serde_json::json!({"b": 1, "a": [1, 2]});
+        for format in [Format::Json, Format::Yaml, Format::Xml] {
+            if format == Format::Xml {
+                continue; // needs a single root element
+            }
+            #[cfg(not(feature = "yaml"))]
+            if format == Format::Yaml {
+                continue;
+            }
+            assert_eq!(
+                dump_like("ignored", &value, format, false).unwrap(),
+                dump(&value, format, false).unwrap()
+            );
+        }
     }
 }

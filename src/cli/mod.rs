@@ -1,6 +1,6 @@
 pub mod formats;
 
-use self::formats::{dump, load, resolve, Format};
+use self::formats::{load, read, resolve, Format};
 use clap::{Args, Parser, Subcommand};
 use drift::{
     diff, diff_files, diff_with, filter_operations, patch, Delta, DiffOptions, Operation, VERSION,
@@ -125,9 +125,12 @@ fn write_output(
     text: String,
     destination: &Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // A document edited in place already ends with its own newline; adding
+    // another would grow the file by a blank line on every run.
+    let text = if text.ends_with('\n') { text } else { format!("{text}\n") };
     match destination {
-        Some(path) if path != "-" => fs::write(path, format!("{text}\n"))?,
-        _ => println!("{text}"),
+        Some(path) if path != "-" => fs::write(path, text)?,
+        _ => print!("{text}"),
     }
     Ok(())
 }
@@ -230,10 +233,14 @@ fn read_patch(path: &str) -> Result<Vec<Delta>, Box<dyn std::error::Error>> {
 
 fn cmd_patch(args: PatchArgs) -> Result<i32, Box<dyn std::error::Error>> {
     let format = resolve(args.format, &args.document);
-    let (document, hints) = load(&args.document, format, args.xml_arrays)?;
+    // Keep the original text: TOML is edited in place so its comments survive.
+    let original = read(&args.document)?;
+    let options = drift::formats::ParseOptions { xml_arrays: args.xml_arrays };
+    let (document, _) = drift::formats::parse_with(&original, format, &options)?;
     let result = patch(document, &read_patch(&args.patch)?)?;
     let destination = if args.in_place { Some(args.document) } else { args.output.output };
-    write_output(dump(&result, format, args.output.compact, &hints)?, &destination)?;
+    let text = drift::formats::dump_like(&original, &result, format, args.output.compact)?;
+    write_output(text, &destination)?;
     Ok(0)
 }
 
@@ -296,5 +303,39 @@ mod tests {
             serde_json::to_string(&op_counts(&ops)).unwrap(),
             r#"{"add":1,"remove":2,"replace":1}"#
         );
+    }
+
+    fn run_patch(document: &std::path::Path, patch_text: &str) {
+        let patch_file = document.with_extension("patch.json");
+        fs::write(&patch_file, patch_text).unwrap();
+        let cli = Cli::try_parse_from([
+            "drift",
+            "patch",
+            document.to_str().unwrap(),
+            patch_file.to_str().unwrap(),
+            "--in-place",
+        ])
+        .unwrap();
+        let Command::Patch(args) = cli.command else { panic!("not a patch command") };
+        assert_eq!(cmd_patch(args).unwrap(), 0);
+    }
+
+    #[test]
+    fn patching_a_toml_file_in_place_keeps_its_comments_and_does_not_grow() {
+        let dir = std::env::temp_dir().join(format!("drift-cli-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("config.toml");
+        let original = "# service\nname = \"x\"  # who\nport = 80\n\n[db]\nurl = 'u'  # where\n";
+        fs::write(&file, original).unwrap();
+
+        run_patch(&file, r#"[{"op": "replace", "path": "/port", "value": 81}]"#);
+        let patched = fs::read_to_string(&file).unwrap();
+        assert_eq!(patched, original.replace("port = 80", "port = 81"));
+
+        // A patch that changes nothing must leave the file exactly as it is: the
+        // trailing newline is not added a second time on every run.
+        run_patch(&file, r#"[{"op": "test", "path": "/port", "value": 81}]"#);
+        assert_eq!(fs::read_to_string(&file).unwrap(), patched);
+        fs::remove_dir_all(&dir).ok();
     }
 }

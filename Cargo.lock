@@ -251,6 +251,7 @@ dependencies = [
  "serde_yaml",
  "thiserror",
  "toml",
+ "toml_edit",
 ]
 
 [[package]]

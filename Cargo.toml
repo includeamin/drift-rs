@@ -31,7 +31,7 @@ default = ["cli", "yaml", "toml", "xml"]
 cli = ["dep:clap", "yaml", "toml", "xml"]
 # Optional document formats for `drift::formats`. JSON is always available.
 yaml = ["dep:serde_yaml"]
-toml = ["dep:toml"]
+toml = ["dep:toml", "dep:toml_edit"]
 xml = ["dep:roxmltree"]
 
 [dependencies]
@@ -42,6 +42,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 serde_yaml = { version = "0.9", optional = true }
 toml = { version = "0.8", features = ["preserve_order"], optional = true }
+# Edits a parsed document in place, keeping comments and formatting. Already a
+# dependency of `toml`; the version is the one it uses.
+toml_edit = { version = "0.22", optional = true }
 thiserror = "2"
 
 [dev-dependencies]
