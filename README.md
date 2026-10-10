@@ -122,7 +122,7 @@ drift = { version = "0.15", default-features = false }
 ```
 
 Using a format whose feature is off returns an error naming the feature to
-enable. The minimum supported Rust version is 1.71, checked in CI by
+enable. The minimum supported Rust version is 1.77, checked in CI by
 `scripts/check-msrv.sh`.
 
 ## Arrays
@@ -306,7 +306,7 @@ cargo run --release --example streaming_large_files
 
 ## Build and test
 
-The library supports Rust 1.71 or newer (checked in CI). Building and testing
+The library supports Rust 1.77 or newer (checked in CI). Building and testing
 this repository, including the web demo, uses the current stable toolchain:
 
 ```bash
