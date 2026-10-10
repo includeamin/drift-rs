@@ -3,7 +3,8 @@ pub mod formats;
 use self::formats::{load, read, resolve, Format};
 use clap::{Args, Parser, Subcommand};
 use drift::{
-    diff, diff_files, diff_with, filter_operations, patch, Delta, DiffOptions, Operation, VERSION,
+    compose, diff, diff_files, diff_with, filter_operations, invert, patch, Delta, DiffOptions,
+    Operation, VERSION,
 };
 use serde_json::Value;
 use std::{
@@ -24,6 +25,8 @@ enum Command {
     Patch(PatchArgs),
     Paths(PathsArgs),
     Check(CheckArgs),
+    Invert(InvertArgs),
+    Compose(ComposeArgs),
 }
 #[derive(Args)]
 struct OutputArgs {
@@ -119,6 +122,54 @@ struct CheckArgs {
     xml_arrays: bool,
     #[command(flatten)]
     output: OutputArgs,
+}
+
+/// The patch that undoes another: the operations to apply to the patched
+/// document to get `DOCUMENT` back.
+#[derive(Args)]
+struct InvertArgs {
+    /// The document the patch applies to
+    document: String,
+    /// The patch to undo, as RFC 6902 JSON (`-` for stdin)
+    patch: String,
+    #[arg(long, value_enum)]
+    format: Option<Format>,
+    /// XML: always read child elements as arrays, even a single one
+    #[arg(long)]
+    xml_arrays: bool,
+    #[command(flatten)]
+    output: OutputArgs,
+}
+
+/// One patch equal to applying several in turn, without the detours: a value
+/// set twice is set once, and a key added then removed disappears.
+#[derive(Args)]
+struct ComposeArgs {
+    /// The document the first patch applies to
+    document: String,
+    /// The patches in the order they are applied, as RFC 6902 JSON (`-` for
+    /// stdin, once)
+    #[arg(required = true)]
+    patches: Vec<String>,
+    #[arg(long, value_enum)]
+    format: Option<Format>,
+    /// XML: always read child elements as arrays, even a single one
+    #[arg(long)]
+    xml_arrays: bool,
+    /// Match array items by this field (repeatable) when working out the result
+    #[arg(long = "array-key")]
+    array_keys: Vec<String>,
+    #[command(flatten)]
+    output: OutputArgs,
+}
+
+/// A patch as RFC 6902 JSON text.
+fn patch_text(operations: &[Delta], compact: bool) -> Result<String, Box<dyn std::error::Error>> {
+    Ok(if compact {
+        serde_json::to_string(operations)?
+    } else {
+        serde_json::to_string_pretty(operations)?
+    })
 }
 
 fn write_output(
@@ -276,6 +327,27 @@ fn cmd_check(args: CheckArgs) -> Result<i32, Box<dyn std::error::Error>> {
     Ok(if ok { 0 } else { 1 })
 }
 
+fn cmd_invert(args: InvertArgs) -> Result<i32, Box<dyn std::error::Error>> {
+    let format = resolve(args.format, &args.document);
+    let (document, _) = load(&args.document, format, args.xml_arrays)?;
+    let undo = invert(&document, &read_patch(&args.patch)?)?;
+    write_output(patch_text(&undo, args.output.compact)?, &args.output.output)?;
+    Ok(0)
+}
+
+fn cmd_compose(args: ComposeArgs) -> Result<i32, Box<dyn std::error::Error>> {
+    let format = resolve(args.format, &args.document);
+    let (document, _) = load(&args.document, format, args.xml_arrays)?;
+    let mut operations = Vec::new();
+    for patch_path in &args.patches {
+        operations.extend(read_patch(patch_path)?);
+    }
+    let options = args.array_keys.iter().fold(DiffOptions::new(), |o, key| o.array_key(key));
+    let squashed = compose(&document, &operations, &options)?;
+    write_output(patch_text(&squashed, args.output.compact)?, &args.output.output)?;
+    Ok(0)
+}
+
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let command = Cli::parse().command;
     let code = match command {
@@ -283,6 +355,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         Command::Patch(args) => cmd_patch(args)?,
         Command::Paths(args) => cmd_paths(args)?,
         Command::Check(args) => cmd_check(args)?,
+        Command::Invert(args) => cmd_invert(args)?,
+        Command::Compose(args) => cmd_compose(args)?,
     };
     std::process::exit(code)
 }
@@ -354,5 +428,149 @@ mod tests {
         run_patch(&file, r#"[{"op": "test", "path": "/replicas", "value": 2}]"#);
         assert_eq!(fs::read_to_string(&file).unwrap(), patched);
         fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A scratch directory that is removed afterwards.
+    struct Scratch(std::path::PathBuf);
+
+    impl Scratch {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("drift-{name}-{}", std::process::id()));
+            fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+        fn file(&self, name: &str, content: &str) -> String {
+            let path = self.0.join(name);
+            fs::write(&path, content).unwrap();
+            path.to_str().unwrap().to_string()
+        }
+        fn path(&self, name: &str) -> String {
+            self.0.join(name).to_str().unwrap().to_string()
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.0).ok();
+        }
+    }
+
+    fn run_cli(args: &[&str]) -> Result<i32, Box<dyn std::error::Error>> {
+        match Cli::try_parse_from(args)?.command {
+            Command::Patch(args) => cmd_patch(args),
+            Command::Invert(args) => cmd_invert(args),
+            Command::Compose(args) => cmd_compose(args),
+            _ => panic!("not a command under test"),
+        }
+    }
+
+    fn read_ops(path: &str) -> Vec<Delta> {
+        serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    fn applied(document: &str, ops: &[Delta]) -> Value {
+        patch(serde_json::from_str(document).unwrap(), ops).unwrap()
+    }
+
+    #[test]
+    fn invert_prints_the_patch_that_undoes_another() {
+        let dir = Scratch::new("invert");
+        let document = r#"{"a": 1, "list": [1, 2, 3], "o": {"k": "v"}}"#;
+        let doc = dir.file("doc.json", document);
+        let forward = dir.file(
+            "p.json",
+            r#"[{"op": "replace", "path": "/a", "value": 9},
+                {"op": "remove", "path": "/list/0"},
+                {"op": "add", "path": "/list/-", "value": 4},
+                {"op": "remove", "path": "/o/k"}]"#,
+        );
+        let undo_file = dir.path("undo.json");
+        assert_eq!(run_cli(&["drift", "invert", &doc, &forward, "-o", &undo_file]).unwrap(), 0);
+
+        let undo = read_ops(&undo_file);
+        let after = applied(document, &read_ops(&forward));
+        assert_eq!(patch(after, &undo).unwrap(), serde_json::from_str::<Value>(document).unwrap());
+        // It is a plain RFC 6902 patch with the undo of the last operation first.
+        let paths: Vec<_> = undo.iter().map(|d| d.path.as_str()).collect();
+        assert_eq!(paths, ["/o/k", "/list/2", "/list/0", "/a"]);
+    }
+
+    #[test]
+    fn invert_reads_the_document_in_any_format() {
+        let dir = Scratch::new("invert-yaml");
+        let doc = dir.file("doc.yaml", "name: app   # keep\nreplicas: 2\n");
+        let forward = dir.file("p.json", r#"[{"op": "replace", "path": "/replicas", "value": 5}]"#);
+        let undo_file = dir.path("undo.json");
+        run_cli(&["drift", "invert", &doc, &forward, "-o", &undo_file]).unwrap();
+        assert_eq!(
+            serde_json::to_value(read_ops(&undo_file)).unwrap(),
+            serde_json::json!([{"op": "replace", "path": "/replicas", "value": 2}])
+        );
+    }
+
+    #[test]
+    fn invert_fails_cleanly_for_a_patch_that_does_not_apply() {
+        let dir = Scratch::new("invert-bad");
+        let doc = dir.file("doc.json", r#"{"a": 1}"#);
+        let forward = dir.file("p.json", r#"[{"op": "remove", "path": "/missing"}]"#);
+        assert!(run_cli(&["drift", "invert", &doc, &forward]).is_err());
+    }
+
+    #[test]
+    fn compose_squashes_several_patches_into_one() {
+        let dir = Scratch::new("compose");
+        let document = r#"{"a": 1, "list": [1, 2, 3]}"#;
+        let doc = dir.file("doc.json", document);
+        let first = dir.file("1.json", r#"[{"op": "replace", "path": "/a", "value": 2}]"#);
+        let second = dir.file(
+            "2.json",
+            r#"[{"op": "replace", "path": "/a", "value": 3}, {"op": "add", "path": "/tmp", "value": 1}]"#,
+        );
+        let third = dir.file(
+            "3.json",
+            r#"[{"op": "remove", "path": "/tmp"}, {"op": "remove", "path": "/list/2"}]"#,
+        );
+        let squashed_file = dir.path("squashed.json");
+        assert_eq!(
+            run_cli(&["drift", "compose", &doc, &first, &second, &third, "-o", &squashed_file])
+                .unwrap(),
+            0
+        );
+
+        let squashed = read_ops(&squashed_file);
+        let sequential = [first, second, third]
+            .iter()
+            .fold(serde_json::from_str::<Value>(document).unwrap(), |doc, file| {
+                patch(doc, &read_ops(file)).unwrap()
+            });
+        assert_eq!(patch(serde_json::from_str(document).unwrap(), &squashed).unwrap(), sequential);
+        assert_eq!(
+            serde_json::to_value(&squashed).unwrap(),
+            serde_json::json!([
+                {"op": "replace", "path": "/a", "value": 3},
+                {"op": "remove", "path": "/list/2"},
+            ])
+        );
+    }
+
+    #[test]
+    fn compose_of_a_patch_and_its_undo_is_empty() {
+        let dir = Scratch::new("compose-undo");
+        let doc = dir.file("doc.json", r#"{"a": [1, 2], "b": 1}"#);
+        let forward = dir.file(
+            "p.json",
+            r#"[{"op": "remove", "path": "/a/0"}, {"op": "replace", "path": "/b", "value": 7}]"#,
+        );
+        let undo = dir.path("undo.json");
+        run_cli(&["drift", "invert", &doc, &forward, "-o", &undo]).unwrap();
+        let out = dir.path("out.json");
+        run_cli(&["drift", "compose", &doc, &forward, &undo, "-o", &out]).unwrap();
+        assert!(read_ops(&out).is_empty());
+    }
+
+    #[test]
+    fn compose_needs_a_document_and_at_least_one_patch() {
+        assert!(Cli::try_parse_from(["drift", "compose", "doc.json"]).is_err());
+        assert!(Cli::try_parse_from(["drift", "invert", "doc.json"]).is_err());
     }
 }
