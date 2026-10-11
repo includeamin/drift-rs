@@ -27,6 +27,86 @@ use std::path::{Path, PathBuf};
 
 type Result<T> = std::result::Result<T, DriftError>;
 
+/// What to do when several rows of a file have the same key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Duplicates {
+    /// Refuse: the two lines are named in the error. The default for keyed rows.
+    #[default]
+    Error,
+    /// Keep the first row with a key and ignore the others, as if they were not in
+    /// the file: rows are numbered without them.
+    First,
+    /// Keep the last row with a key and ignore the others.
+    Last,
+    /// Match the nth row with a key in one file to the nth row with that key in
+    /// the other. The default for whole-row keys, where identical rows are normal.
+    Occurrence,
+}
+
+/// How [`diff_records_with`] matches and compares rows.
+///
+/// Build one with [`RecordOptions::new`] and the methods below; the struct is
+/// `#[non_exhaustive]` so options can be added without breaking callers.
+///
+/// ```
+/// use drift::{DiffOptions, Duplicates, RecordOptions};
+///
+/// let options = RecordOptions::new()
+///     .key("id")
+///     .key("/address/region")
+///     .duplicates(Duplicates::Last)
+///     .diff(DiffOptions::new().ignore_path("/*/updatedAt"));
+/// assert_eq!(options.key, ["id", "/address/region"]);
+/// ```
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub struct RecordOptions {
+    /// The fields that together identify a row, each a field name or a JSON
+    /// Pointer such as `/address/region`. The value of every one must be a string,
+    /// number or boolean, and none may lie inside another.
+    pub key: Vec<String>,
+    /// Use the whole row as its own key instead: rows match when they are equal
+    /// (member order and spacing do not matter), so a changed row is a removal and
+    /// an addition. Rows may then be any JSON value. Incompatible with `key`.
+    pub whole_row: bool,
+    /// What to do about repeated keys. `None` means [`Duplicates::Error`] for keyed
+    /// rows and [`Duplicates::Occurrence`] for whole rows.
+    pub duplicates: Option<Duplicates>,
+    /// How rows are compared once matched, and what is left out.
+    pub diff: DiffOptions,
+}
+
+impl RecordOptions {
+    /// No key yet: add one with [`key`](Self::key) or [`whole_row`](Self::whole_row).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Adds a field (or JSON Pointer) to the key; several make a composite key.
+    pub fn key(mut self, field: impl Into<String>) -> Self {
+        self.key.push(field.into());
+        self
+    }
+
+    /// Matches rows by their whole content; see [`whole_row`](Self::whole_row).
+    pub fn whole_row(mut self) -> Self {
+        self.whole_row = true;
+        self
+    }
+
+    /// Sets the policy for repeated keys.
+    pub fn duplicates(mut self, policy: Duplicates) -> Self {
+        self.duplicates = Some(policy);
+        self
+    }
+
+    /// Sets how matched rows are compared (ignored paths, keys of inner arrays).
+    pub fn diff(mut self, options: DiffOptions) -> Self {
+        self.diff = options;
+        self
+    }
+}
+
 /// Differences between two files of records, one JSON object per line, matched
 /// by the value of the field `key`.
 ///
@@ -50,27 +130,44 @@ type Result<T> = std::result::Result<T, DriftError>;
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 ///
-/// Memory is the index of both files, 40 bytes a row each, a few more bytes a
-/// row for matching and planning, and the operations themselves. Every row must be
-/// a JSON object whose `key` is a string, number or boolean, and keys must be
-/// unique in each file; anything else is an error naming the file and line.
+/// This is [`diff_records_with`] with one key and the default policy for repeated
+/// keys, which is to refuse them.
 pub fn diff_records(
     old: &Path,
     new: &Path,
     key: &str,
     options: &DiffOptions,
 ) -> Result<Vec<Delta>> {
-    let spec = KeySpec::parse(&[key.to_string()])?;
-    let old_rows = Rows::index(old, &spec)?;
-    let new_rows = Rows::index(new, &spec)?;
-    let old_order = old_rows.sorted_unique(&spec)?;
-    new_rows.sorted_unique(&spec)?;
-    let matches: Vec<Option<usize>> = new_rows
-        .keys
-        .iter()
-        .map(|key| {
+    diff_records_with(old, new, &RecordOptions::new().key(key).diff(options.clone()))
+}
+
+/// Differences between two files of records, with a composite or nested key, a
+/// policy for repeated keys, or the whole row as the key. See [`RecordOptions`].
+///
+/// The operations are those of `diff_with` over the two files read as arrays and
+/// matched by that key, so applying them to the old rows (after the policy for
+/// repeated keys has dropped some) gives the new rows. With whole-row keys a
+/// changed row is never edited in place: it is a removal and an addition.
+///
+/// Memory is the index of both files, 40 bytes a row each, a few more bytes a
+/// row for matching and planning, and the operations themselves. Problems with
+/// the data (a missing or non-scalar key, a repeated key under the default
+/// policy, a line that is not JSON) are errors naming the file and line.
+pub fn diff_records_with(old: &Path, new: &Path, options: &RecordOptions) -> Result<Vec<Delta>> {
+    let spec = KeySpec::parse(options)?;
+    let policy = options.duplicates.unwrap_or(if options.whole_row {
+        Duplicates::Occurrence
+    } else {
+        Duplicates::Error
+    });
+    let old_rows = Rows::index(old, &spec)?.resolve(policy, &spec)?;
+    let new_rows = Rows::index(new, &spec)?.resolve(policy, &spec)?;
+    let old_order = old_rows.sorted();
+    let matches: Vec<Option<usize>> = (0..new_rows.len())
+        .map(|row| {
+            let key = new_rows.key(row);
             old_order
-                .binary_search_by(|&row| old_rows.keys[row as usize].cmp(key))
+                .binary_search_by(|&at| old_rows.key(at as usize).cmp(&key))
                 .ok()
                 .map(|at| old_order[at] as usize)
         })
@@ -78,7 +175,7 @@ pub fn diff_records(
     drop(old_order);
 
     let mut files = Files { old: open(old)?, new: open(new)? };
-    let ctx = Context::new(options);
+    let ctx = Context::new(&options.diff);
     let mut operations = Vec::new();
     let mut failure = None;
     plan_keyed(old_rows.len(), &matches, |step| {
@@ -120,10 +217,11 @@ fn apply(
             out.push(Delta::with_value(Operation::Add, at(index), row));
         }
         KeyedStep::Pair { old: o, new: n } => {
-            // Equal bytes: the rows are the same, and nothing is read. Rows that
+            // With whole rows as keys, matched rows are equal rows by definition.
+            // Otherwise equal bytes mean equal rows and nothing is read; rows that
             // differ in bytes only (field order, spacing) are read and found equal
             // by `walk`, which reports nothing for them.
-            if old.hashes[o] != new.hashes[n] {
+            if !old.whole_row && old.hash(o) != new.hash(n) {
                 let (old_row, new_row) =
                     (old.read(&mut files.old, o)?, new.read(&mut files.new, n)?);
                 walk(&new_row, &old_row, &at(n), ctx, out);
@@ -133,59 +231,114 @@ fn apply(
     Ok(())
 }
 
-/// Where the key of a row is: one field, or a JSON Pointer into the row.
+/// Where the key of a row is: one or more fields or JSON Pointers, or the whole row.
 #[derive(Debug, Clone)]
 struct KeySpec {
+    whole_row: bool,
+    parts: Vec<KeyPart>,
+}
+
+#[derive(Debug, Clone)]
+struct KeyPart {
     /// What the user wrote, for messages.
     label: String,
     tokens: Vec<String>,
 }
 
 impl KeySpec {
-    fn parse(specs: &[String]) -> Result<KeySpec> {
-        let [spec] = specs else {
-            return Err(DriftError::Parse("exactly one key is supported".into()));
-        };
-        let tokens = if spec.starts_with('/') { split_pointer(spec)? } else { vec![spec.clone()] };
-        if tokens.is_empty() {
-            return Err(DriftError::Parse("a key must name a field".into()));
+    fn parse(options: &RecordOptions) -> Result<KeySpec> {
+        let fail = |message: String| Err(DriftError::Parse(message));
+        if options.whole_row {
+            if !options.key.is_empty() {
+                return fail("use either a key or the whole row as the key, not both".into());
+            }
+            return Ok(KeySpec { whole_row: true, parts: Vec::new() });
         }
-        Ok(KeySpec { label: spec.clone(), tokens })
+        if options.key.is_empty() {
+            return fail(
+                "rows need a key: name the field that identifies a row, or match whole rows".into(),
+            );
+        }
+        let mut parts: Vec<KeyPart> = Vec::new();
+        for label in &options.key {
+            let tokens =
+                if label.starts_with('/') { split_pointer(label)? } else { vec![label.clone()] };
+            if tokens.is_empty() {
+                return fail("a key must name a field".into());
+            }
+            if let Some(other) = parts
+                .iter()
+                .find(|p| p.tokens.starts_with(&tokens) || tokens.starts_with(&p.tokens))
+            {
+                return fail(format!(
+                    "the key parts `{}` and `{label}` overlap: one is inside the other",
+                    other.label
+                ));
+            }
+            parts.push(KeyPart { label: label.clone(), tokens });
+        }
+        Ok(KeySpec { whole_row: false, parts })
+    }
+
+    /// The key parts of a row that is already parsed, as JSON, for messages.
+    fn text(&self, row: &Value) -> String {
+        let value = |part: &KeyPart| {
+            let pointer: String =
+                part.tokens.iter().map(|t| format!("/{}", crate::escape_token(t))).collect();
+            row.pointer(&pointer).cloned().unwrap_or(Value::Null)
+        };
+        match self.parts.as_slice() {
+            [single] => value(single).to_string(),
+            parts => Value::Array(parts.iter().map(value).collect()).to_string(),
+        }
     }
 }
 
 /// What can be wrong with a row, found while reading its key.
 enum Fault {
     NotObject,
-    NoKey,
-    BadKey,
+    /// The key part at this position is missing from the row.
+    NoKey(usize),
+    /// The key part at this position is not a string, number or boolean.
+    BadKey(usize),
     Json(serde_json::Error),
 }
 
-/// Reads the key out of one line without building the rest of the row: the other
-/// fields are skipped as they are read, which allocates nothing.
-fn read_key(line: &[u8], spec: &KeySpec) -> std::result::Result<Value, Fault> {
-    let found = RefCell::new(None);
+/// Reads the key parts out of one line without building the rest of the row: the
+/// other fields are skipped as they are read, which allocates nothing.
+fn read_key(line: &[u8], spec: &KeySpec) -> std::result::Result<Vec<Value>, Fault> {
+    let tokens: Vec<&[String]> = spec.parts.iter().map(|p| p.tokens.as_slice()).collect();
+    let found = RefCell::new(vec![None; tokens.len()]);
     let object = Cell::new(false);
+    let active: Vec<usize> = (0..tokens.len()).collect();
     let mut deserializer = serde_json::Deserializer::from_slice(line);
-    let seed = KeySeed { tokens: &spec.tokens, found: &found, object: &object };
+    let seed =
+        KeySeed { parts: &tokens, depth: 0, active: &active, found: &found, object: &object };
     seed.deserialize(&mut deserializer).map_err(Fault::Json)?;
     deserializer.end().map_err(Fault::Json)?;
     if !object.get() {
         return Err(Fault::NotObject);
     }
-    match found.into_inner() {
-        None => Err(Fault::NoKey),
-        Some(key @ (Value::String(_) | Value::Number(_) | Value::Bool(_))) => Ok(key),
-        Some(_) => Err(Fault::BadKey),
-    }
+    found
+        .into_inner()
+        .into_iter()
+        .enumerate()
+        .map(|(at, part)| match part {
+            None => Err(Fault::NoKey(at)),
+            Some(key @ (Value::String(_) | Value::Number(_) | Value::Bool(_))) => Ok(key),
+            Some(_) => Err(Fault::BadKey(at)),
+        })
+        .collect()
 }
 
-/// Walks one value, keeping the part at `tokens` and skipping everything else.
+/// Walks one value, keeping the parts of the key found at `parts[..][depth..]`
+/// (for the parts in `active`) and skipping everything else.
 struct KeySeed<'a> {
-    tokens: &'a [String],
-    found: &'a RefCell<Option<Value>>,
-    /// Set when the value being walked at the top is an object.
+    parts: &'a [&'a [String]],
+    depth: usize,
+    active: &'a [usize],
+    found: &'a RefCell<Vec<Option<Value>>>,
+    /// Set when the value being walked is an object.
     object: &'a Cell<bool>,
 }
 
@@ -209,22 +362,33 @@ impl<'de> Visitor<'de> for KeySeed<'_> {
 
     fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> std::result::Result<(), A::Error> {
         self.object.set(true);
-        let (head, rest) = self.tokens.split_first().expect("a key has a token");
         while let Some(name) = map.next_key::<std::borrow::Cow<str>>()? {
-            if name == head.as_str() {
-                if rest.is_empty() {
-                    *self.found.borrow_mut() = Some(map.next_value::<Value>()?);
-                } else {
-                    // A nested object: its own `object` flag is irrelevant.
+            let hit = self.active.iter().copied().find(|&p| self.parts[p][self.depth] == name);
+            match hit {
+                None => {
+                    map.next_value::<IgnoredAny>()?;
+                }
+                Some(part) if self.parts[part].len() == self.depth + 1 => {
+                    self.found.borrow_mut()[part] = Some(map.next_value::<Value>()?);
+                }
+                Some(_) => {
+                    // Parts continuing under this name (none ends here: no part
+                    // lies inside another).
+                    let deeper: Vec<usize> = self
+                        .active
+                        .iter()
+                        .copied()
+                        .filter(|&p| self.parts[p][self.depth] == name)
+                        .collect();
                     let inner = Cell::new(false);
                     map.next_value_seed(KeySeed {
-                        tokens: rest,
+                        parts: self.parts,
+                        depth: self.depth + 1,
+                        active: &deeper,
                         found: self.found,
                         object: &inner,
                     })?;
                 }
-            } else {
-                map.next_value::<IgnoredAny>()?;
             }
         }
         Ok(())
@@ -259,6 +423,7 @@ impl<'de> Visitor<'de> for KeySeed<'_> {
 /// A file of records, indexed: one entry per row, in file order.
 struct Rows {
     path: PathBuf,
+    whole_row: bool,
     /// A 128-bit hash of each row's key. The number 1 and the string "1" are
     /// different keys.
     keys: Vec<u128>,
@@ -269,6 +434,10 @@ struct Rows {
     /// `end`), which also takes in any blank lines after it: they are trimmed.
     offsets: Vec<u64>,
     end: u64,
+    /// When repeated keys have been dropped, the rows that are left, as positions
+    /// in the vectors above; `None` means all of them. Row numbers in the diff
+    /// count these rows only.
+    view: Option<Vec<u32>>,
 }
 
 fn open(path: &Path) -> Result<File> {
@@ -299,8 +468,22 @@ const PARALLEL_FROM: u64 = 8 * 1024 * 1024;
 const MAX_THREADS: usize = 8;
 
 impl Rows {
+    /// The number of rows that take part.
     fn len(&self) -> usize {
-        self.keys.len()
+        self.view.as_ref().map_or(self.keys.len(), Vec::len)
+    }
+
+    /// Position in the index vectors of row `row`.
+    fn at(&self, row: usize) -> usize {
+        self.view.as_ref().map_or(row, |view| view[row] as usize)
+    }
+
+    fn key(&self, row: usize) -> u128 {
+        self.keys[self.at(row)]
+    }
+
+    fn hash(&self, row: usize) -> u128 {
+        self.hashes[self.at(row)]
     }
 
     /// 1-based line number of `offset`, found by counting the lines before it.
@@ -357,10 +540,12 @@ impl Rows {
 
         let mut rows = Rows {
             path: path.to_path_buf(),
+            whole_row: spec.whole_row,
             keys: Vec::new(),
             hashes: Vec::new(),
             offsets: Vec::new(),
             end,
+            view: None,
         };
         for part in parts {
             match part {
@@ -370,11 +555,12 @@ impl Rows {
                     rows.offsets.extend(part.offsets);
                 }
                 Err(Failure { offset, fault }) => {
+                    let label = |at: usize| spec.parts[at].label.as_str();
                     let message = match fault {
                         Fault::NotObject => "a row must be a JSON object".to_string(),
-                        Fault::NoKey => format!("the row has no `{}` field", spec.label),
-                        Fault::BadKey => {
-                            format!("`{}` must be a string, number or boolean", spec.label)
+                        Fault::NoKey(at) => format!("the row has no `{}` field", label(at)),
+                        Fault::BadKey(at) => {
+                            format!("`{}` must be a string, number or boolean", label(at))
                         }
                         Fault::Json(error) => error.to_string(),
                     };
@@ -385,39 +571,85 @@ impl Rows {
         Ok(rows)
     }
 
-    /// Row numbers sorted by key, or an error naming the lines of a duplicate.
-    fn sorted_unique(&self, spec: &KeySpec) -> Result<Vec<u32>> {
-        let mut order: Vec<u32> = (0..self.len() as u32).collect();
+    /// Applies the policy for repeated keys.
+    fn resolve(mut self, policy: Duplicates, spec: &KeySpec) -> Result<Rows> {
+        let mut order: Vec<u32> = (0..self.keys.len() as u32).collect();
         order.sort_unstable_by_key(|&row| (self.keys[row as usize], row));
-        for pair in order.windows(2) {
-            let (first, second) = (pair[0] as usize, pair[1] as usize);
-            if self.keys[first] == self.keys[second] {
-                let key = self.key_text(first, spec);
-                return Err(self.error_at(
-                    self.offsets[second],
-                    format!(
-                        "duplicate key {key} (first seen at line {})",
-                        self.line_of(self.offsets[first])
-                    ),
-                ));
+        match policy {
+            Duplicates::Error => {
+                for pair in order.windows(2) {
+                    let (first, second) = (pair[0] as usize, pair[1] as usize);
+                    if self.keys[first] == self.keys[second] {
+                        let key = self.key_text(first, spec);
+                        return Err(self.error_at(
+                            self.offsets[second],
+                            format!(
+                                "duplicate key {key} (first seen at line {})",
+                                self.line_of(self.offsets[first])
+                            ),
+                        ));
+                    }
+                }
+            }
+            Duplicates::Occurrence => {
+                // The nth row with a key gets the key of "that key, nth time".
+                let mut start = 0;
+                while start < order.len() {
+                    let key = self.keys[order[start] as usize];
+                    let mut end = start;
+                    while end < order.len() && self.keys[order[end] as usize] == key {
+                        end += 1;
+                    }
+                    for (nth, &row) in order[start + 1..end].iter().enumerate() {
+                        self.keys[row as usize] = hash128(|h| (key, nth + 1).hash(h));
+                    }
+                    start = end;
+                }
+            }
+            Duplicates::First | Duplicates::Last => {
+                let mut keep = vec![false; self.keys.len()];
+                let mut start = 0;
+                while start < order.len() {
+                    let key = self.keys[order[start] as usize];
+                    let mut end = start;
+                    while end < order.len() && self.keys[order[end] as usize] == key {
+                        end += 1;
+                    }
+                    // `order` is sorted by row within a key.
+                    let chosen =
+                        if policy == Duplicates::First { order[start] } else { order[end - 1] };
+                    keep[chosen as usize] = true;
+                    start = end;
+                }
+                self.view =
+                    Some((0..self.keys.len() as u32).filter(|&r| keep[r as usize]).collect());
             }
         }
-        Ok(order)
+        Ok(self)
     }
 
-    /// The key of row `index`, as JSON, read back for a message.
+    /// The rows that take part, as row numbers, sorted by key.
+    fn sorted(&self) -> Vec<u32> {
+        let mut order: Vec<u32> = (0..self.len() as u32).collect();
+        order.sort_unstable_by_key(|&row| (self.key(row as usize), row));
+        order
+    }
+
+    /// The key of the row at index position `index`, as JSON, for a message.
     fn key_text(&self, index: usize, spec: &KeySpec) -> String {
         File::open(&self.path)
             .ok()
-            .and_then(|mut file| self.read(&mut file, index).ok())
-            .and_then(|row| {
-                row.pointer(&format!("/{}", spec.tokens.join("/"))).map(Value::to_string)
-            })
-            .unwrap_or_else(|| "?".to_string())
+            .and_then(|mut file| self.read_at(&mut file, index).ok())
+            .map_or_else(|| "?".to_string(), |row| spec.text(&row))
     }
 
-    /// Reads row `index` back from the file.
-    fn read(&self, file: &mut File, index: usize) -> Result<Value> {
+    /// Reads row `row` back from the file.
+    fn read(&self, file: &mut File, row: usize) -> Result<Value> {
+        self.read_at(file, self.at(row))
+    }
+
+    /// Reads the row at index position `index` back from the file.
+    fn read_at(&self, file: &mut File, index: usize) -> Result<Value> {
         let start = self.offsets[index];
         let stop = self.offsets.get(index + 1).copied().unwrap_or(self.end);
         let mut buffer = vec![0u8; (stop - start) as usize];
@@ -480,8 +712,17 @@ fn index_part(
         if text.is_empty() {
             continue;
         }
-        let key = read_key(text, spec).map_err(|fault| Failure { offset: line_start, fault })?;
-        part.keys.push(hash_key(&key));
+        let key = if spec.whole_row {
+            // The whole row is the key, so it has to be read in full.
+            let row: Value = serde_json::from_slice(text)
+                .map_err(|e| Failure { offset: line_start, fault: Fault::Json(e) })?;
+            fingerprint(&row)
+        } else {
+            let parts =
+                read_key(text, spec).map_err(|fault| Failure { offset: line_start, fault })?;
+            hash_key(&parts)
+        };
+        part.keys.push(key);
         part.hashes.push(hash_bytes(text));
         part.offsets.push(line_start);
     }
@@ -502,20 +743,67 @@ fn hash_bytes(bytes: &[u8]) -> u128 {
     hash128(|hasher| bytes.hash(hasher))
 }
 
-/// A hash of a scalar key that keeps the number 1, the string "1" and the
-/// number 1.0 apart, as the in-memory diff does.
-fn hash_key(key: &Value) -> u128 {
-    hash128(|hasher| match key {
-        Value::String(text) => (0u8, text).hash(hasher),
-        Value::Bool(b) => (1u8, *b).hash(hasher),
-        Value::Number(n) => match (n.as_i64(), n.as_u64(), n.as_f64()) {
-            (Some(i), _, _) => (2u8, i).hash(hasher),
-            (None, Some(u), _) => (3u8, u).hash(hasher),
-            (None, None, Some(f)) => (4u8, f.to_bits()).hash(hasher),
-            _ => 5u8.hash(hasher),
-        },
-        _ => 6u8.hash(hasher),
+/// A hash of the scalar parts of a key that keeps the number 1, the string "1"
+/// and the number 1.0 apart, as the in-memory diff does.
+fn hash_key(parts: &[Value]) -> u128 {
+    hash128(|hasher| {
+        parts.len().hash(hasher);
+        for key in parts {
+            match key {
+                Value::String(text) => (0u8, text).hash(hasher),
+                Value::Bool(b) => (1u8, *b).hash(hasher),
+                Value::Number(n) => match (n.as_i64(), n.as_u64(), n.as_f64()) {
+                    (Some(i), _, _) => (2u8, i).hash(hasher),
+                    (None, Some(u), _) => (3u8, u).hash(hasher),
+                    (None, None, Some(f)) => (4u8, f.to_bits()).hash(hasher),
+                    _ => 5u8.hash(hasher),
+                },
+                _ => 6u8.hash(hasher),
+            }
+        }
     })
+}
+
+/// A 128-bit fingerprint of a whole value such that equal values (as `==` on
+/// `serde_json::Value`: object members in any order, `1` different from `1.0`)
+/// have equal fingerprints. It is the key of a row matched by its whole content.
+fn fingerprint(value: &Value) -> u128 {
+    (u128::from(lane(value, 0x9E37_79B9_7F4A_7C15)) << 64)
+        | u128::from(lane(value, 0xC2B2_AE3D_27D4_EB4F))
+}
+
+/// One 64-bit half of the fingerprint; the two halves use different salts.
+fn lane(value: &Value, salt: u64) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    salt.hash(&mut hasher);
+    match value {
+        Value::Null => 0u8.hash(&mut hasher),
+        Value::Bool(b) => (1u8, *b).hash(&mut hasher),
+        Value::Number(n) => match (n.as_i64(), n.as_u64(), n.as_f64()) {
+            (Some(i), _, _) => (2u8, i).hash(&mut hasher),
+            (None, Some(u), _) => (3u8, u).hash(&mut hasher),
+            (None, None, Some(f)) => (4u8, f.to_bits()).hash(&mut hasher),
+            _ => 8u8.hash(&mut hasher),
+        },
+        Value::String(text) => (5u8, text).hash(&mut hasher),
+        Value::Array(items) => {
+            (6u8, items.len()).hash(&mut hasher);
+            for item in items {
+                lane(item, salt).hash(&mut hasher);
+            }
+        }
+        Value::Object(members) => {
+            (7u8, members.len()).hash(&mut hasher);
+            // Added together so the order of the members does not matter.
+            let combined = members.iter().fold(0u64, |sum, (name, member)| {
+                let mut entry = DefaultHasher::new();
+                (salt, name, lane(member, salt)).hash(&mut entry);
+                sum.wrapping_add(entry.finish())
+            });
+            combined.hash(&mut hasher);
+        }
+    }
+    hasher.finish()
 }
 
 #[cfg(test)]
@@ -816,7 +1104,7 @@ mod tests {
     }
 
     fn key(field: &str) -> KeySpec {
-        KeySpec::parse(&[field.to_string()]).unwrap()
+        KeySpec::parse(&RecordOptions::new().key(field)).unwrap()
     }
 
     #[test]
@@ -922,9 +1210,9 @@ mod tests {
                     _ => "not an object".to_string(),
                 };
                 let got = match read_key(line.as_bytes(), &spec) {
-                    Ok(v) => format!("key {v}"),
-                    Err(Fault::NoKey) => "no key".to_string(),
-                    Err(Fault::BadKey) => "bad key".to_string(),
+                    Ok(parts) => format!("key {}", parts[0]),
+                    Err(Fault::NoKey(_)) => "no key".to_string(),
+                    Err(Fault::BadKey(_)) => "bad key".to_string(),
                     Err(Fault::NotObject) => "not an object".to_string(),
                     Err(Fault::Json(e)) => panic!("{field} round {round}: {e}: {line}"),
                 };
@@ -950,5 +1238,324 @@ mod tests {
             ops.iter().map(|o| (o.op.as_str(), o.path.as_str())).collect::<Vec<_>>(),
             [("move", "/0"), ("replace", "/0/v")]
         );
+    }
+
+    // ----- composite keys, duplicates and whole-row keys ---------------------------
+
+    use crate::diff::{plan_keyed, walk, Context, KeyedStep};
+    use std::collections::HashMap;
+
+    /// An independent, deliberately naive version of the matching rules, to check
+    /// the real one against. It shares only the planner and the row walk.
+    fn canon(value: &Value) -> Value {
+        match value {
+            Value::Object(map) => {
+                let sorted: std::collections::BTreeMap<_, _> =
+                    map.iter().map(|(k, v)| (k.clone(), canon(v))).collect();
+                Value::Object(sorted.into_iter().collect())
+            }
+            Value::Array(items) => Value::Array(items.iter().map(canon).collect()),
+            other => other.clone(),
+        }
+    }
+
+    /// The rows that take part, each with the key it is matched by.
+    fn select(rows: &[Value], options: &RecordOptions) -> Vec<(String, Value)> {
+        let keyed: Vec<(String, Value)> = rows
+            .iter()
+            .map(|row| {
+                let key = if options.whole_row {
+                    canon(row).to_string()
+                } else {
+                    let parts: Vec<Value> = options
+                        .key
+                        .iter()
+                        .map(|spec| {
+                            let pointer = if spec.starts_with('/') {
+                                spec.clone()
+                            } else {
+                                format!("/{spec}")
+                            };
+                            row.pointer(&pointer).cloned().expect("test rows have their keys")
+                        })
+                        .collect();
+                    Value::Array(parts).to_string()
+                };
+                (key, row.clone())
+            })
+            .collect();
+        let policy = options.duplicates.unwrap_or(if options.whole_row {
+            Duplicates::Occurrence
+        } else {
+            Duplicates::Error
+        });
+        let mut seen: HashMap<String, usize> = HashMap::new();
+        for (key, _) in &keyed {
+            *seen.entry(key.clone()).or_default() += 1;
+        }
+        let mut count: HashMap<String, usize> = HashMap::new();
+        keyed
+            .into_iter()
+            .filter_map(|(key, row)| {
+                let nth = *count.entry(key.clone()).and_modify(|n| *n += 1).or_insert(0);
+                let total = seen[&key];
+                match policy {
+                    Duplicates::Error => {
+                        assert_eq!(total, 1, "the oracle is only used on unique keys");
+                        Some((key, row))
+                    }
+                    Duplicates::First => (nth == 0).then_some((key, row)),
+                    Duplicates::Last => (nth + 1 == total).then_some((key, row)),
+                    Duplicates::Occurrence => Some((format!("{key}#{nth}"), row)),
+                }
+            })
+            .collect()
+    }
+
+    fn oracle(old: &[Value], new: &[Value], options: &RecordOptions) -> Vec<Delta> {
+        let (old, new) = (select(old, options), select(new, options));
+        let index: HashMap<&str, usize> =
+            old.iter().enumerate().map(|(i, (k, _))| (k.as_str(), i)).collect();
+        let matches: Vec<Option<usize>> =
+            new.iter().map(|(k, _)| index.get(k.as_str()).copied()).collect();
+        let ctx = Context::new(&options.diff);
+        let at = |i: usize| join_pointer("", &i.to_string());
+        let mut ops = Vec::new();
+        plan_keyed(old.len(), &matches, |step| match step {
+            KeyedStep::Remove(i) => ops.push(Delta::new(Operation::Remove, at(i))),
+            KeyedStep::Move { from, to } => ops.push(Delta {
+                op: Operation::Move,
+                path: at(to),
+                value: None,
+                from_path: Some(at(from)),
+            }),
+            KeyedStep::Add(n) => {
+                ops.push(Delta::with_value(Operation::Add, at(n), new[n].1.clone()))
+            }
+            KeyedStep::Pair { old: o, new: n } => {
+                walk(&new[n].1, &old[o].1, &at(n), &ctx, &mut ops)
+            }
+        });
+        ops
+    }
+
+    /// Streams the rows from files and checks the result against the oracle, and
+    /// that it turns the selected old rows into the selected new ones.
+    fn assert_matches_oracle(old: &[Value], new: &[Value], options: &RecordOptions) -> Vec<Delta> {
+        let dir = Dir::new();
+        let (old_file, new_file) = (dir.rows("old.ndjson", old), dir.rows("new.ndjson", new));
+        let streamed = diff_records_with(&old_file, &new_file, options)
+            .unwrap_or_else(|e| panic!("{e}: {old:?} -> {new:?}"));
+        assert_eq!(streamed, oracle(old, new, options), "{old:?} -> {new:?}");
+        if options.diff.ignore_paths.is_empty() {
+            let kept = |rows: &[Value]| -> Vec<Value> {
+                select(rows, options).into_iter().map(|(_, row)| row).collect()
+            };
+            let patched = patch(Value::Array(kept(old)), &streamed).unwrap();
+            assert_eq!(patched, Value::Array(kept(new)), "{streamed:?}");
+        }
+        streamed
+    }
+
+    fn region_row(id: u64, region: &str, v: u64) -> Value {
+        json!({"id": id, "region": region, "v": v, "meta": {"zone": region}})
+    }
+
+    #[test]
+    fn a_key_can_be_several_fields_and_a_row_is_a_different_row_in_another_region() {
+        let options = RecordOptions::new().key("id").key("region");
+        let old = [region_row(1, "eu", 1), region_row(1, "us", 2), region_row(2, "eu", 3)];
+        let new = [
+            region_row(2, "eu", 3),
+            region_row(1, "us", 9),
+            region_row(1, "eu", 1),
+            region_row(3, "eu", 0),
+        ];
+        let ops = assert_matches_oracle(&old, &new, &options);
+        // (1, us) changed, (2, eu) moved, (3, eu) is new: nothing is confused with (1, eu).
+        assert!(ops.iter().any(|o| o.path.ends_with("/v")), "{ops:?}");
+        assert!(ops.iter().any(|o| o.op == Operation::Add), "{ops:?}");
+        // With only `id` as the key the same files are a duplicate-key error.
+        let dir = Dir::new();
+        let error = diff_records_with(
+            &dir.rows("o.ndjson", &old),
+            &dir.rows("n.ndjson", &new),
+            &RecordOptions::new().key("id"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("duplicate"), "{error}");
+    }
+
+    #[test]
+    fn composite_keys_can_mix_fields_and_pointers() {
+        let options = RecordOptions::new().key("id").key("/meta/zone");
+        let old = [region_row(1, "eu", 1), region_row(1, "us", 2)];
+        let new = [region_row(1, "us", 3), region_row(1, "eu", 1)];
+        assert_matches_oracle(&old, &new, &options);
+    }
+
+    #[test]
+    fn composite_key_problems_name_the_part_that_is_wrong() {
+        let dir = Dir::new();
+        let ok = dir.text("ok.ndjson", "{\"id\":1,\"region\":\"eu\"}\n");
+        let options = RecordOptions::new().key("id").key("region");
+        let no_region = dir.text("a.ndjson", "{\"id\":1}\n");
+        let error = diff_records_with(&ok, &no_region, &options).unwrap_err().to_string();
+        assert!(error.contains("`region`") && error.contains("line 1"), "{error}");
+        let bad_region = dir.text("b.ndjson", "{\"id\":1,\"region\":[1]}\n");
+        let error = diff_records_with(&ok, &bad_region, &options).unwrap_err().to_string();
+        assert!(
+            error.contains("`region`") && error.contains("string, number or boolean"),
+            "{error}"
+        );
+        // Parts that contain one another, or repeat, cannot be told apart.
+        for keys in [["/a", "/a/b"], ["id", "id"], ["/a/b", "/a"]] {
+            let options = RecordOptions::new().key(keys[0]).key(keys[1]);
+            let error = diff_records_with(&ok, &ok, &options).unwrap_err().to_string();
+            assert!(error.contains("overlap"), "{keys:?}: {error}");
+        }
+        // And there has to be some key.
+        assert!(diff_records_with(&ok, &ok, &RecordOptions::new()).is_err());
+    }
+
+    #[test]
+    fn duplicate_keys_can_keep_the_first_the_last_or_pair_them_up() {
+        let old =
+            [json!({"id": 1, "v": "a"}), json!({"id": 2, "v": "b"}), json!({"id": 1, "v": "c"})];
+        let new = [
+            json!({"id": 1, "v": "d"}),
+            json!({"id": 1, "v": "c"}),
+            json!({"id": 2, "v": "b"}),
+            json!({"id": 1, "v": "e"}),
+        ];
+        for policy in [Duplicates::First, Duplicates::Last, Duplicates::Occurrence] {
+            assert_matches_oracle(&old, &new, &RecordOptions::new().key("id").duplicates(policy));
+        }
+        // First keeps the first row of each key: old is [1:a, 2:b], new is [1:d, 2:b].
+        let ops = assert_matches_oracle(
+            &old,
+            &new,
+            &RecordOptions::new().key("id").duplicates(Duplicates::First),
+        );
+        assert_eq!(ops.iter().map(|o| o.path.as_str()).collect::<Vec<_>>(), ["/0/v"]);
+        // Last keeps the last: old is [2:b, 1:c], new is [2:b, 1:e].
+        let ops = assert_matches_oracle(
+            &old,
+            &new,
+            &RecordOptions::new().key("id").duplicates(Duplicates::Last),
+        );
+        assert_eq!(ops.iter().map(|o| o.path.as_str()).collect::<Vec<_>>(), ["/1/v"]);
+        // Occurrence pairs the nth row of a key with the nth row of that key.
+        let ops = assert_matches_oracle(
+            &old,
+            &new,
+            &RecordOptions::new().key("id").duplicates(Duplicates::Occurrence),
+        );
+        assert!(!ops.is_empty());
+    }
+
+    #[test]
+    fn rows_without_a_key_are_matched_by_their_whole_content() {
+        let options = RecordOptions::new().whole_row();
+        let old = [json!({"a": 1, "b": [1, 2]}), json!({"a": 2}), json!({"a": 3})];
+        let new = [json!({"b": [1, 2], "a": 1}), json!({"a": 3}), json!({"a": 9}), json!({"a": 3})];
+        let ops = assert_matches_oracle(&old, &new, &options);
+        // A changed row is a removal and an addition, never an in-place edit.
+        assert!(ops.iter().all(|o| o.op != Operation::Replace), "{ops:?}");
+        assert!(ops.iter().any(|o| o.op == Operation::Remove), "{ops:?}");
+        // Identical files have no differences, however many identical rows they hold.
+        let same = [json!({"a": 1}), json!({"a": 1}), json!({"a": 1})];
+        assert!(assert_matches_oracle(&same, &same, &options).is_empty());
+        // The count of identical rows matters: one fewer is one removal.
+        let ops = assert_matches_oracle(&same, &same[..2], &options);
+        assert_eq!(ops.len(), 1);
+    }
+
+    #[test]
+    fn whole_row_mode_takes_rows_that_are_not_objects() {
+        let options = RecordOptions::new().whole_row();
+        let old = [json!(1), json!("two"), json!([3]), json!(null)];
+        let new = [json!(null), json!(1), json!([3, 4])];
+        assert_matches_oracle(&old, &new, &options);
+    }
+
+    #[test]
+    fn a_key_and_whole_row_mode_together_are_refused() {
+        let dir = Dir::new();
+        let ok = dir.text("ok.ndjson", "{\"id\":1}\n");
+        assert!(diff_records_with(&ok, &ok, &RecordOptions::new().key("id").whole_row()).is_err());
+    }
+
+    #[test]
+    fn random_files_with_composite_keys_duplicates_and_no_key_match_the_oracle() {
+        // xorshift: deterministic, no extra dependencies.
+        let mut state = 0x510E527FADE682D1u64;
+        let mut next = move |n: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % n
+        };
+        let configs = [
+            RecordOptions::new().key("id").key("region"),
+            RecordOptions::new().key("/meta/n").duplicates(Duplicates::First),
+            RecordOptions::new().key("id").duplicates(Duplicates::Last),
+            RecordOptions::new().key("id").key("region").duplicates(Duplicates::Occurrence),
+            RecordOptions::new().whole_row(),
+            RecordOptions::new().whole_row().diff(DiffOptions::new().ignore_path("/*/v")),
+        ];
+        for round in 0..200 {
+            let options = &configs[round % configs.len()];
+            let unique = options.duplicates.is_none() && !options.whole_row;
+            let make = |next: &mut dyn FnMut(u64) -> u64| -> Vec<Value> {
+                let mut rows: Vec<Value> = (0..next(12))
+                    .map(|_| {
+                        let (id, region) = (next(5), ["eu", "us"][next(2) as usize]);
+                        let (v, n, t) = (next(3), next(4), [next(2), next(2)]);
+                        json!({"id": id, "region": region, "v": v, "meta": {"n": n}, "t": t})
+                    })
+                    .collect();
+                if unique {
+                    // Composite keys must still be unique when no policy says otherwise.
+                    let mut seen = std::collections::HashSet::new();
+                    rows.retain(|r| seen.insert((r["id"].clone(), r["region"].clone())));
+                }
+                rows
+            };
+            let (old, new) = (make(&mut next), make(&mut next));
+            assert_matches_oracle(&old, &new, options);
+        }
+    }
+
+    #[test]
+    fn the_whole_row_fingerprint_ignores_member_order_but_nothing_else() {
+        let same = [
+            (
+                json!({"a": 1, "b": [1, 2], "c": {"x": 1, "y": 2}}),
+                json!({"c": {"y": 2, "x": 1}, "b": [1, 2], "a": 1}),
+            ),
+            (json!({}), json!({})),
+            (json!("é"), json!("\u{00e9}")),
+        ];
+        for (a, b) in same {
+            assert_eq!(fingerprint(&a), fingerprint(&b), "{a} vs {b}");
+        }
+        let different = [
+            (json!({"a": 1}), json!({"a": 2})),
+            (json!({"a": 1}), json!({"b": 1})),
+            (json!(1), json!(1.0)),
+            (json!(1), json!("1")),
+            (json!(true), json!(1)),
+            (json!(null), json!(false)),
+            (json!([1, 2]), json!([2, 1])),
+            (json!([]), json!({})),
+            (json!({"a": {"b": 1}}), json!({"a": {"b": 2}})),
+            (json!({"a": 1, "b": 2}), json!({"a": 2, "b": 1})),
+            (json!(""), json!(null)),
+        ];
+        for (a, b) in different {
+            assert_ne!(fingerprint(&a), fingerprint(&b), "{a} vs {b}");
+        }
     }
 }

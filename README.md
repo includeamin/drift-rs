@@ -311,46 +311,72 @@ let operations = diff_files(Path::new("old.json"), Path::new("new.json"))?;
 ### Files of records (NDJSON)
 
 A file with one JSON object per line (`.ndjson` or `.jsonl`) can be compared
-without loading it, matching rows by a key field:
+without loading it, matching rows by a key:
 
 ```bash
 drift diff --array-key id old.ndjson new.ndjson
+drift diff --array-key id,region old.ndjson new.ndjson     # a composite key
+drift diff --array-key /user/id old.ndjson new.ndjson      # a field inside the row
+drift diff --keyless old.ndjson new.ndjson                 # no key: match whole rows
 ```
 
 ```rust
-use drift::{diff_records, DiffOptions};
+use drift::{diff_records_with, DiffOptions, Duplicates, RecordOptions};
 
-let operations = diff_records(old, new, "id", &DiffOptions::new())?;
+let options = RecordOptions::new()
+    .key("id")
+    .key("region")
+    .duplicates(Duplicates::Last)
+    .diff(DiffOptions::new().ignore_path("/*/updatedAt"));
+let operations = diff_records_with(old, new, &options)?;
 ```
 
-Each file is read once into a small index (per row: its key, a 128-bit
-fingerprint of its contents and where it sits in the file). Rows are matched by
-key, rows with equal fingerprints are skipped without being parsed again, and only
-rows that changed are read back from disk. The result is exactly what the
-in-memory diff gives for the same rows as arrays matched by that key (the same
-planner produces both), so a row inserted at the front is one `add`, not a
-replacement of every row after it. `--ignore-path '/*/field'` works inside rows;
-the first `--array-key` is the row key and any others match arrays inside rows.
+Each file is read once, in parallel, into a small index: per row a hash of its
+key, a hash of its bytes and where it starts in the file (40 bytes). Only the key
+is parsed while reading. Rows are matched by key, rows whose bytes are equal are
+skipped without being parsed, and only rows that differ are read back from disk.
+The result is exactly what the in-memory diff gives for the same rows as arrays
+matched by that key (the same planner produces both), so a row inserted at the
+front is one `add`, not a replacement of every row after it.
+`--ignore-path '/*/field'` works inside rows. With a key, the first `--array-key`
+is the row key and any others match arrays inside rows.
+
+- **Composite and nested keys:** `--array-key id,region`, or a JSON Pointer such
+  as `/user/id`. Each part must be a string, number or boolean.
+- **Repeated keys** are an error naming both lines, unless `--duplicates` says
+  what to do: `first` or `last` keeps one row per key and ignores the rest (rows
+  are then numbered without the ignored ones), and `occurrence` matches the nth
+  row with a key to the nth row with that key in the other file.
+- **`--keyless`** matches rows by their whole content (field order and spacing do
+  not matter), so no key is needed and rows may be any JSON value. A changed row is
+  a removal plus an addition, never an edit, and identical rows are counted:
+  `--duplicates occurrence` is the default there.
 
 Measured on two NDJSON files of 400,000 rows (48 MB each) with 8,000 rows changed,
 1,000 inserted in the middle and 1,000 deleted, on the same machine:
 
 | | Peak memory | Time |
 |---|---|---|
-| In memory, before this change | 1,283 MB | 198 s |
+| In memory, before the keyed-diff fix | 1,283 MB | 198 s |
 | In memory, now | 1,283 MB | 6.9 s |
-| Streaming records | 100 MB | 3.7 s |
+| Streaming records, first version | 100 MB | 2.8 s |
+| **Streaming records, `--array-key id`** | **52 MB** | **0.7-1.2 s** |
+| Streaming records, `--array-key id,name` | 58 MB | about 1 s |
+| Streaming records, `--keyless` | 65 MB | 2.6-3.6 s |
 
-All three produced byte-identical output. The in-memory speed-up has two causes:
-matched rows were looked up from the start of the list each time, which made a
-keyed diff quadratic in the number of rows (80,000 rows took 3.5 s), and equal
-values were walked field by field instead of being skipped.
+The in-memory and keyed streaming runs produced byte-identical output. Keyless is
+slower because every row has to be parsed in full to be fingerprinted. The
+in-memory speed-up has two causes: matched rows were looked up from the start of
+the list each time, which made a keyed diff quadratic in the number of rows
+(80,000 rows took 3.5 s), and equal values were walked field by field instead of
+being skipped.
 
-Limits: rows must be JSON objects, the key must be a string, number or boolean
-that is unique in each file, and NDJSON cannot come from stdin or be used with
-`--grep`. Memory is about 250 bytes a row across the two files, so a billion rows
-is still too many for one machine's RAM; the index could be spilled to disk if
-that is needed.
+Limits: rows must be JSON objects (except with `--keyless`), and NDJSON cannot
+come from stdin or be used with `--grep`. Memory is still proportional to the
+number of rows, about 130 bytes a row across the two files, so a billion rows is
+too many for one machine's RAM; sorting or partitioning the index on disk would
+remove that, at the cost of a different output model for reordered rows. Rows with
+equal hashes are treated as equal, which is wrong only for a 128-bit collision.
 
 ### Lower-level APIs
 

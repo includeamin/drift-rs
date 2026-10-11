@@ -57,7 +57,7 @@ pub use model::{Delta, Operation};
 pub use patch::patch;
 pub use paths::list_json_paths;
 pub use pointer::{escape_token, join_pointer, split_pointer, unescape_token};
-pub use records::diff_records;
+pub use records::{diff_records, diff_records_with, Duplicates, RecordOptions};
 pub use search::{filter_operations, path_matches};
 pub use stream_io::diff_files;
 
