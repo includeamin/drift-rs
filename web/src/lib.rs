@@ -2,6 +2,8 @@
 //! result together with timings and size metrics.
 
 mod clock;
+pub mod records;
+pub mod tools;
 pub mod tree;
 
 use clock::Clock;
@@ -180,6 +182,46 @@ pub fn run_diff(
         Err(failure) => serde_json::to_string(&failure),
     };
     result.unwrap_or_else(|e| format!(r#"{{"ok":false,"side":"old","error":"{e}"}}"#))
+}
+
+/// Applies a patch to a document and returns JSON: `{ok, text, format, kept}`, or
+/// `{ok: false, error}`.
+#[wasm_bindgen]
+pub fn run_apply(document: &str, hint: &str, patch: &str) -> String {
+    tools::reply(tools::apply(document, hint, patch))
+}
+
+/// The patch that undoes `patch` on `document`, as JSON.
+#[wasm_bindgen]
+pub fn run_invert(document: &str, hint: &str, patch: &str) -> String {
+    tools::reply(tools::invert(document, hint, patch))
+}
+
+/// Squashes patches applied in turn to `document` into one, as JSON.
+#[wasm_bindgen]
+pub fn run_compose(
+    document: &str,
+    hint: &str,
+    patches: &str,
+    array_keys: &str,
+    ignore_paths: &str,
+) -> String {
+    tools::reply(tools::compose(document, hint, patches, array_keys, ignore_paths))
+}
+
+/// Compares two files of records (`ndjson`, `csv` or `tsv`) as the CLI does, from
+/// text. Returns JSON: a report, or `{ok: false, error}`.
+#[wasm_bindgen]
+pub fn run_records(
+    old: &str,
+    new: &str,
+    format: &str,
+    key: &str,
+    duplicates: &str,
+    keyless: bool,
+    ignore_paths: &str,
+) -> String {
+    tools::reply(records::run(old, new, format, key, duplicates, keyless, ignore_paths))
 }
 
 /// Name of the format that would be used for `text`, given a hint.

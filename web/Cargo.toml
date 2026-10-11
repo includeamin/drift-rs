@@ -10,7 +10,11 @@ publish = false
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-drift = { path = "..", default-features = false, features = ["yaml", "toml", "xml"] }
+drift = { path = "..", default-features = false, features = ["yaml-comments", "toml", "xml"] }
+csv = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 wasm-bindgen = "0.2"
+
+[dev-dependencies]
+drift = { path = "..", default-features = false, features = ["yaml-comments", "toml", "xml", "csv"] }
