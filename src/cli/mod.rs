@@ -80,6 +80,15 @@ struct DiffArgs {
     /// to refuse (`occurrence` for `--keyless`).
     #[arg(long, value_enum)]
     duplicates: Option<DuplicatesArg>,
+    /// CSV and TSV files: the type of some columns, as COLUMN:TYPE pairs
+    /// (comma-separated or repeated), with TYPE one of string, int, float, bool
+    /// or json. Cells are strings otherwise.
+    #[arg(long = "types")]
+    types: Vec<String>,
+    /// CSV and TSV files: the character between cells (default: a comma, or a
+    /// tab for .tsv). One character, or tab, comma, semicolon or pipe.
+    #[arg(long)]
+    delimiter: Option<String>,
     #[command(flatten)]
     output: OutputArgs,
 }
@@ -230,42 +239,136 @@ impl From<DuplicatesArg> for drift::Duplicates {
     }
 }
 
-/// Files of records, one JSON object per line.
-fn is_records(path: &str) -> bool {
-    let extension = Path::new(path).extension().and_then(|e| e.to_str());
-    extension.is_some_and(|e| e.eq_ignore_ascii_case("ndjson") || e.eq_ignore_ascii_case("jsonl"))
+/// The kinds of record file `drift diff` can stream.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RecordsKind {
+    /// One JSON value per line.
+    Ndjson,
+    /// Delimited text with a header; the byte is the usual delimiter for the extension.
+    Csv(u8),
 }
 
-/// Whether this diff compares two NDJSON files as records, and if so whether it
-/// can: they need a key and cannot come from stdin or be grepped.
-fn records_inputs(args: &DiffArgs) -> Result<bool, Box<dyn std::error::Error>> {
-    let (old, new) = (is_records(&args.old), is_records(&args.new));
-    if !old && !new {
+/// The kind of record file a path is, from its extension.
+fn records_kind(path: &str) -> Option<RecordsKind> {
+    let extension = Path::new(path).extension().and_then(|e| e.to_str())?.to_ascii_lowercase();
+    match extension.as_str() {
+        "ndjson" | "jsonl" => Some(RecordsKind::Ndjson),
+        "csv" => Some(RecordsKind::Csv(b',')),
+        "tsv" => Some(RecordsKind::Csv(b'\t')),
+        _ => None,
+    }
+}
+
+/// `--delimiter`: one character, or a word for the common ones.
+fn parse_delimiter(text: &str) -> Result<u8, Box<dyn std::error::Error>> {
+    match text {
+        "tab" => return Ok(b'\t'),
+        "comma" => return Ok(b','),
+        "semicolon" => return Ok(b';'),
+        "pipe" => return Ok(b'|'),
+        _ => {}
+    }
+    match text.as_bytes() {
+        [byte] if byte.is_ascii() => Ok(*byte),
+        _ => Err("--delimiter must be one character (or tab, comma, semicolon or pipe)".into()),
+    }
+}
+
+/// `--types`: `column:type` pairs, comma-separated or repeated.
+fn parse_types(
+    specs: &[String],
+) -> Result<Vec<(String, drift::ColumnType)>, Box<dyn std::error::Error>> {
+    let mut columns = Vec::new();
+    for pair in specs.iter().flat_map(|s| s.split(',')).map(str::trim).filter(|p| !p.is_empty()) {
+        let (name, kind) = pair
+            .rsplit_once(':')
+            .ok_or_else(|| format!("--types expects COLUMN:TYPE pairs, not `{pair}`"))?;
+        let kind = match kind.to_ascii_lowercase().as_str() {
+            "string" => drift::ColumnType::String,
+            "int" => drift::ColumnType::Int,
+            "float" => drift::ColumnType::Float,
+            "bool" => drift::ColumnType::Bool,
+            "json" => drift::ColumnType::Json,
+            other => {
+                return Err(format!(
+                    "unknown column type `{other}` in --types: use string, int, float, bool or json"
+                )
+                .into())
+            }
+        };
+        columns.push((name.to_string(), kind));
+    }
+    Ok(columns)
+}
+
+/// How the files of this diff are compared as records, or `None` if they are
+/// ordinary documents. Records need a key, and cannot come from stdin or be grepped.
+fn records_inputs(
+    args: &DiffArgs,
+) -> Result<Option<drift::RecordFormat>, Box<dyn std::error::Error>> {
+    let (old, new) = (records_kind(&args.old), records_kind(&args.new));
+    let csv_only = !args.types.is_empty() || args.delimiter.is_some();
+    if old.is_none() && new.is_none() {
         if args.keyless || args.duplicates.is_some() {
-            return Err(
-                "--keyless and --duplicates apply only to NDJSON files (.ndjson or .jsonl)".into(),
-            );
+            return Err("--keyless and --duplicates apply only to record files (NDJSON, CSV or TSV: .ndjson, .jsonl, .csv or .tsv)".into());
         }
-        return Ok(false);
+        if csv_only {
+            return Err("--types and --delimiter apply only to CSV and TSV files".into());
+        }
+        return Ok(None);
     }
     if args.old == "-" || args.new == "-" {
-        return Err("NDJSON files are streamed from disk, so they cannot be read from stdin".into());
+        return Err("record files are streamed from disk, so they cannot be read from stdin".into());
     }
-    if !(old && new) {
+    let (Some(old), Some(new)) = (old, new) else {
         return Err(
-            "to compare records, both inputs must be NDJSON files (.ndjson or .jsonl)".into()
+            "to compare records, both inputs must be files of the same kind (NDJSON, CSV or TSV)"
+                .into(),
+        );
+    };
+    let same_kind = matches!(
+        (old, new),
+        (RecordsKind::Ndjson, RecordsKind::Ndjson) | (RecordsKind::Csv(_), RecordsKind::Csv(_))
+    );
+    if !same_kind {
+        return Err(
+            "to compare records, both inputs must be files of the same kind (NDJSON, CSV or TSV)"
+                .into(),
         );
     }
     if args.array_keys.is_empty() && !args.keyless {
         return Err(
-            "NDJSON files need --array-key FIELD, the field that identifies a row, or --keyless"
+            "record files need --array-key FIELD, the field that identifies a row, or --keyless"
                 .into(),
         );
     }
     if !args.values.is_empty() {
-        return Err("--grep is not available for NDJSON files, which are not loaded whole".into());
+        return Err("--grep is not available for record files, which are not loaded whole".into());
     }
-    Ok(true)
+    match (old, new) {
+        (RecordsKind::Csv(a), RecordsKind::Csv(b)) => {
+            let delimiter =
+                match &args.delimiter {
+                    Some(text) => parse_delimiter(text)?,
+                    None if a == b => a,
+                    None => return Err(
+                        "a .csv and a .tsv file are split differently: say how with --delimiter"
+                            .into(),
+                    ),
+                };
+            let mut options = drift::CsvOptions::new().delimiter(delimiter);
+            for (name, kind) in parse_types(&args.types)? {
+                options = options.column(name, kind);
+            }
+            Ok(Some(drift::RecordFormat::Csv(options)))
+        }
+        _ => {
+            if csv_only {
+                return Err("--types and --delimiter apply only to CSV and TSV files".into());
+            }
+            Ok(Some(drift::RecordFormat::Ndjson))
+        }
+    }
 }
 
 fn cmd_diff(args: DiffArgs) -> Result<i32, Box<dyn std::error::Error>> {
@@ -286,7 +389,7 @@ fn cmd_diff(args: DiffArgs) -> Result<i32, Box<dyn std::error::Error>> {
         && args.array_keys.is_empty()
         && args.ignore_paths.is_empty();
 
-    let (diff_operations, old) = if records {
+    let (diff_operations, old) = if let Some(record_format) = records {
         // One JSON object per line: matched by key and streamed, never loaded whole.
         // The first --array-key names the row key (several fields, comma-separated,
         // make a composite key); any others match arrays inside rows.
@@ -298,7 +401,7 @@ fn cmd_diff(args: DiffArgs) -> Result<i32, Box<dyn std::error::Error>> {
         };
         let diff = inner_keys.iter().fold(DiffOptions::new(), |o, key| o.array_key(key));
         let diff = args.ignore_paths.iter().fold(diff, |o, pattern| o.ignore_path(pattern));
-        let mut options = drift::RecordOptions::new().diff(diff);
+        let mut options = drift::RecordOptions::new().diff(diff).format(record_format);
         options = key_fields.into_iter().fold(options, |o, field| o.key(field));
         if args.keyless {
             options = options.whole_row();
@@ -852,5 +955,112 @@ mod tests {
             let message = run_cli(&args).unwrap_err().to_string();
             assert!(message.contains("NDJSON"), "{flag:?}: {message}");
         }
+    }
+
+    #[test]
+    fn csv_and_tsv_files_are_compared_as_rows_with_a_header() {
+        let dir = Scratch::new("csv-cli");
+        let old = dir.file("old.csv", "id,name,score\n1,Ada,10\n2,Grace,20\n3,Linus,30\n");
+        let new = dir.file("new.csv", "id,name,score\n0,Alan,5\n1,Ada,10\n2,Grace,21\n");
+        let out = dir.path("ops.json");
+        let ops = ndjson_ops(&[&old, &new, "--array-key", "id"], &out);
+        assert_eq!(
+            ops,
+            [
+                ("remove".to_string(), "/2".to_string()),
+                ("add".into(), "/0".into()),
+                ("replace".into(), "/2/score".into())
+            ]
+        );
+        // The cells are text unless given a type, so a changed score is a string...
+        assert_eq!(read_ops(&out).last().unwrap().value, Some(serde_json::json!("21")));
+        // ...and a number with one.
+        ndjson_ops(&[&old, &new, "--array-key", "id", "--types", "score:int"], &out);
+        assert_eq!(read_ops(&out).last().unwrap().value, Some(serde_json::json!(21)));
+        // A .tsv file is split at tabs without being told to.
+        let old = dir.file("old.tsv", "id\tv\n1\ta,b\n2\tc\n");
+        let new = dir.file("new.tsv", "id\tv\n1\ta,b\n2\td\n");
+        assert_eq!(
+            ndjson_ops(&[&old, &new, "--array-key", "id"], &out),
+            [("replace".to_string(), "/1/v".to_string())]
+        );
+    }
+
+    #[test]
+    fn the_delimiter_and_column_types_can_be_set() {
+        let dir = Scratch::new("csv-options");
+        let old = dir.file("old.csv", "id;price;active\n1;1,5;true\n2;2,5;false\n");
+        let new = dir.file("new.csv", "id;price;active\n1;1,5;false\n2;2,5;false\n");
+        let out = dir.path("ops.json");
+        let ops = ndjson_ops(
+            &[&old, &new, "--array-key", "id", "--delimiter", ";", "--types", "id:int,active:bool"],
+            &out,
+        );
+        assert_eq!(ops, [("replace".to_string(), "/0/active".to_string())]);
+        assert_eq!(read_ops(&out)[0].value, Some(serde_json::json!(false)));
+        // Words work for the delimiter too, and --types can be repeated.
+        let pipe_old = dir.file("p-old.csv", "id|v\n1|a\n");
+        let pipe_new = dir.file("p-new.csv", "id|v\n1|b\n");
+        let ops = ndjson_ops(
+            &[
+                &pipe_old,
+                &pipe_new,
+                "--array-key",
+                "id",
+                "--delimiter",
+                "pipe",
+                "--types",
+                "id:int",
+                "--types",
+                "v:string",
+            ],
+            &out,
+        );
+        assert_eq!(ops, [("replace".to_string(), "/0/v".to_string())]);
+    }
+
+    #[test]
+    fn csv_diffs_say_what_is_wrong_with_the_options() {
+        let dir = Scratch::new("csv-errors");
+        let a = dir.file("a.csv", "id,v\n1,x\n");
+        let b = dir.file("b.csv", "id,v\n1,y\n");
+        let message = |extra: &[&str]| {
+            let mut args = vec!["drift", "diff", &a, &b, "--array-key", "id"];
+            args.extend_from_slice(extra);
+            run_cli(&args).unwrap_err().to_string()
+        };
+        assert!(message(&["--types", "v"]).contains("COLUMN:TYPE"));
+        assert!(message(&["--types", "v:number"]).contains("string, int, float, bool or json"));
+        assert!(message(&["--types", "nope:int"]).contains("`nope`"));
+        assert!(message(&["--delimiter", "ab"]).contains("one character"));
+        // Different kinds of file cannot be compared as records.
+        let nd = dir.file("c.ndjson", "{\"id\":1}\n");
+        let error =
+            run_cli(&["drift", "diff", &a, &nd, "--array-key", "id"]).unwrap_err().to_string();
+        assert!(error.contains("same kind"), "{error}");
+        // These options are for CSV and TSV only.
+        let nd2 = dir.file("d.ndjson", "{\"id\":1}\n");
+        let error =
+            run_cli(&["drift", "diff", &nd, &nd2, "--array-key", "id", "--types", "id:int"])
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("CSV"), "{error}");
+        let json = dir.file("e.json", "[]");
+        let error =
+            run_cli(&["drift", "diff", &json, &json, "--delimiter", ";"]).unwrap_err().to_string();
+        assert!(error.contains("CSV"), "{error}");
+    }
+
+    #[test]
+    fn csv_files_can_be_matched_without_a_key() {
+        let dir = Scratch::new("csv-keyless");
+        let old = dir.file("old.csv", "a,b\n1,x\n2,y\n2,y\n");
+        let new = dir.file("new.csv", "a,b\n2,y\n1,x\n3,z\n");
+        let ops = ndjson_ops(&[&old, &new, "--keyless"], &dir.path("ops.json"));
+        assert!(ops.iter().all(|(op, _)| op != "replace"), "{ops:?}");
+        assert!(
+            ops.iter().any(|(op, _)| op == "add") && ops.iter().any(|(op, _)| op == "remove"),
+            "{ops:?}"
+        );
     }
 }
