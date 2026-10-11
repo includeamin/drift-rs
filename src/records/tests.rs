@@ -22,6 +22,10 @@ impl Dir {
         let text: String = rows.iter().map(|r| format!("{r}\n")).collect();
         self.text(name, &text)
     }
+    #[cfg(feature = "csv")]
+    fn path(&self, name: &str) -> std::path::PathBuf {
+        self.0.join(name)
+    }
     fn text(&self, name: &str, text: &str) -> std::path::PathBuf {
         let path = self.0.join(name);
         std::fs::write(&path, text).unwrap();
@@ -727,5 +731,469 @@ fn the_whole_row_fingerprint_ignores_member_order_but_nothing_else() {
     ];
     for (a, b) in different {
         assert_ne!(fingerprint(&a), fingerprint(&b), "{a} vs {b}");
+    }
+}
+
+// ----- CSV and TSV ---------------------------------------------------------------
+
+#[cfg(feature = "csv")]
+mod csv_format {
+    use super::*;
+    use crate::{ColumnType, CsvOptions, RecordFormat};
+
+    /// CSV text written by the `csv` crate, so quoting is not our own invention.
+    fn text(header: &[&str], rows: &[Vec<&str>], delimiter: u8) -> String {
+        let mut writer = ::csv::WriterBuilder::new().delimiter(delimiter).from_writer(Vec::new());
+        writer.write_record(header).unwrap();
+        for row in rows {
+            writer.write_record(row).unwrap();
+        }
+        String::from_utf8(writer.into_inner().unwrap()).unwrap()
+    }
+
+    /// What a row should read as: an object of its cells, converted by column type.
+    fn object(header: &[&str], cells: &[&str], types: &[(&str, ColumnType)]) -> Value {
+        let mut map = serde_json::Map::new();
+        for (name, cell) in header.iter().zip(cells) {
+            let kind = types.iter().find(|(n, _)| n == name).map(|(_, k)| *k);
+            let value = match kind {
+                None | Some(ColumnType::String) => json!(cell),
+                Some(_) if cell.is_empty() => Value::Null,
+                Some(ColumnType::Int) => match cell.parse::<i64>() {
+                    Ok(i) => json!(i),
+                    Err(_) => json!(cell.parse::<u64>().unwrap()),
+                },
+                Some(ColumnType::Float) => json!(cell.parse::<f64>().unwrap()),
+                Some(ColumnType::Bool) => json!(cell.eq_ignore_ascii_case("true")),
+                Some(ColumnType::Json) => serde_json::from_str(cell).unwrap(),
+            };
+            map.insert(name.to_string(), value);
+        }
+        Value::Object(map)
+    }
+
+    fn csv_options(types: &[(&str, ColumnType)]) -> CsvOptions {
+        types.iter().fold(CsvOptions::new(), |o, (name, kind)| o.column(*name, *kind))
+    }
+
+    fn with_csv(options: RecordOptions, csv: CsvOptions) -> RecordOptions {
+        options.format(RecordFormat::Csv(csv))
+    }
+
+    /// Diffs two CSV texts and checks the result against the oracle run on the same
+    /// rows as objects.
+    fn assert_csv_matches_oracle(
+        header: &[&str],
+        old: &[Vec<&str>],
+        new: &[Vec<&str>],
+        options: &RecordOptions,
+        types: &[(&str, ColumnType)],
+    ) -> Vec<Delta> {
+        let dir = Dir::new();
+        let (old_file, new_file) = (
+            dir.text("old.csv", &text(header, old, b',')),
+            dir.text("new.csv", &text(header, new, b',')),
+        );
+        let streamed = diff_records_with(&old_file, &new_file, options)
+            .unwrap_or_else(|e| panic!("{e}: {old:?} -> {new:?}"));
+        let rows = |data: &[Vec<&str>]| -> Vec<Value> {
+            data.iter().map(|cells| object(header, cells, types)).collect()
+        };
+        assert_eq!(streamed, oracle(&rows(old), &rows(new), options), "{old:?} -> {new:?}");
+        streamed
+    }
+
+    const HEADER: [&str; 4] = ["id", "name", "note", "score"];
+
+    #[test]
+    fn csv_rows_are_diffed_like_the_same_rows_as_objects() {
+        let options = with_csv(RecordOptions::new().key("id"), CsvOptions::new());
+        let old = vec![
+            vec!["1", "Ada", "plain", "10"],
+            vec!["2", "Grace", "has, comma", "20"],
+            vec!["3", "Linus", "say \"hi\"", "30"],
+            vec!["4", "Café ☃", "two\nlines", ""],
+        ];
+        let cases: Vec<Vec<Vec<&str>>> = vec![
+            old.clone(),
+            vec![
+                vec!["0", "New", "", "0"],
+                old[0].clone(),
+                old[1].clone(),
+                old[2].clone(),
+                old[3].clone(),
+            ],
+            vec![
+                old[0].clone(),
+                vec!["2", "Grace", "has, comma", "21"],
+                old[2].clone(),
+                old[3].clone(),
+            ],
+            vec![old[3].clone(), old[2].clone(), old[1].clone(), old[0].clone()],
+            vec![old[1].clone(), old[3].clone()],
+            vec![
+                old[0].clone(),
+                old[1].clone(),
+                old[2].clone(),
+                vec!["4", "Café ☃", "one line", ""],
+            ],
+            vec![],
+        ];
+        for new in cases {
+            assert_csv_matches_oracle(&HEADER, &old, &new, &options, &[]);
+        }
+        assert_csv_matches_oracle(&HEADER, &[], &old, &options, &[]);
+    }
+
+    #[test]
+    fn cells_are_strings_unless_a_column_is_given_a_type() {
+        let types = [
+            ("id", ColumnType::Int),
+            ("score", ColumnType::Float),
+            ("active", ColumnType::Bool),
+            ("meta", ColumnType::Json),
+        ];
+        let header = ["id", "score", "active", "meta", "name"];
+        let old =
+            vec![vec!["1", "1.5", "true", "{\"a\":[1]}", "x"], vec!["2", "", "FALSE", "", "007"]];
+        let new = vec![
+            vec!["1", "2.5", "true", "{\"a\":[1,2]}", "x"],
+            vec!["2", "", "false", "null", "007"],
+        ];
+        let options = with_csv(RecordOptions::new().key("id"), csv_options(&types));
+        let ops = assert_csv_matches_oracle(&header, &old, &new, &options, &types);
+        // The new score is a number, not the text "2.5"; "007" stays text.
+        let score = ops.iter().find(|o| o.path == "/0/score").expect("score changed");
+        assert_eq!(score.value, Some(json!(2.5)));
+        assert!(ops.iter().all(|o| o.path != "/1/name"));
+        // Without the types the same files compare as strings.
+        let plain = with_csv(RecordOptions::new().key("id"), CsvOptions::new());
+        let ops = assert_csv_matches_oracle(&header, &old, &new, &plain, &[]);
+        let score = ops.iter().find(|o| o.path == "/0/score").expect("score changed");
+        assert_eq!(score.value, Some(json!("2.5")));
+    }
+
+    #[test]
+    fn the_key_can_be_a_typed_column_and_one_and_one_point_zero_differ() {
+        let types = [("id", ColumnType::Int)];
+        let old = vec![vec!["1", "a", "", ""], vec!["2", "b", "", ""]];
+        let new = vec![vec!["2", "b", "", ""], vec!["1", "A", "", ""]];
+        let options = with_csv(RecordOptions::new().key("id"), csv_options(&types));
+        assert_csv_matches_oracle(&HEADER, &old, &new, &options, &types);
+    }
+
+    #[test]
+    fn a_byte_order_mark_windows_line_endings_and_blank_lines_are_handled() {
+        let dir = Dir::new();
+        let old = dir.text("old.csv", "\u{feff}id,v\r\n1,a\r\n\r\n2,b\r\n");
+        let new = dir.text("new.csv", "id,v\n1,a\n\n2,B\n\n");
+        let options = with_csv(RecordOptions::new().key("id"), CsvOptions::new());
+        let ops = diff_records_with(&old, &new, &options).unwrap();
+        // Rows are numbered without the header and the blank lines.
+        assert_eq!(ops.iter().map(|o| o.path.as_str()).collect::<Vec<_>>(), ["/1/v"]);
+    }
+
+    #[test]
+    fn a_file_with_only_a_header_or_nothing_has_no_rows() {
+        let dir = Dir::new();
+        let rows = dir.text("rows.csv", "id,v\n1,a\n2,b\n");
+        let header_only = dir.text("header.csv", "id,v\n");
+        let empty = dir.text("empty.csv", "");
+        let options = with_csv(RecordOptions::new().key("id"), CsvOptions::new());
+        assert!(diff_records_with(&header_only, &header_only, &options).unwrap().is_empty());
+        assert!(diff_records_with(&empty, &empty, &options).unwrap().is_empty());
+        let ops = diff_records_with(&header_only, &rows, &options).unwrap();
+        assert_eq!(ops.iter().map(|o| o.op.as_str()).collect::<Vec<_>>(), ["add", "add"]);
+        let ops = diff_records_with(&rows, &empty, &options).unwrap();
+        assert_eq!(ops.iter().map(|o| o.op.as_str()).collect::<Vec<_>>(), ["remove", "remove"]);
+    }
+
+    #[test]
+    fn the_two_files_may_have_different_columns() {
+        let dir = Dir::new();
+        let old = dir.text("old.csv", "id,price\n1,10\n2,20\n");
+        let new = dir.text("new.csv", "id,cost,currency\n1,10,EUR\n2,25,EUR\n");
+        let options = with_csv(RecordOptions::new().key("id"), CsvOptions::new());
+        let ops = diff_records_with(&old, &new, &options).unwrap();
+        // price became cost (a removal and an addition), and a column was added.
+        let paths: Vec<_> = ops.iter().map(|o| (o.op.as_str(), o.path.as_str())).collect();
+        assert!(paths.contains(&("remove", "/0/price")), "{paths:?}");
+        assert!(paths.contains(&("add", "/0/cost")), "{paths:?}");
+        assert!(paths.contains(&("add", "/1/currency")), "{paths:?}");
+        // Rows with the same cells but different columns are not mistaken for equal ones.
+        assert!(!ops.is_empty());
+    }
+
+    #[test]
+    fn tabs_and_other_delimiters_work() {
+        let dir = Dir::new();
+        for (delimiter, name) in [(b'\t', "t.tsv"), (b';', "s.csv"), (b'|', "p.csv")] {
+            let old = dir.text(
+                &format!("old-{name}"),
+                &text(&["id", "v"], &[vec!["1", "a;b"], vec!["2", "c"]], delimiter),
+            );
+            let new = dir.text(
+                &format!("new-{name}"),
+                &text(&["id", "v"], &[vec!["1", "a;b"], vec!["2", "d"]], delimiter),
+            );
+            let options =
+                with_csv(RecordOptions::new().key("id"), CsvOptions::new().delimiter(delimiter));
+            let ops = diff_records_with(&old, &new, &options).unwrap();
+            assert_eq!(ops.iter().map(|o| o.path.as_str()).collect::<Vec<_>>(), ["/1/v"], "{name}");
+        }
+    }
+
+    #[test]
+    fn a_row_with_a_quoted_newline_is_one_row_and_lines_are_counted_physically() {
+        let dir = Dir::new();
+        let good = dir.text("good.csv", "id,v\n1,\"a\nb\"\n2,c\n");
+        let changed = dir.text("changed.csv", "id,v\n1,\"a\nB\"\n2,c\n");
+        let options = with_csv(RecordOptions::new().key("id"), CsvOptions::new());
+        let ops = diff_records_with(&good, &changed, &options).unwrap();
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].path, "/0/v");
+        assert_eq!(ops[0].value, Some(json!("a\nB")));
+        // Row 3 starts on physical line 5, after a two-line row.
+        let ragged = dir.text("ragged.csv", "id,v\n1,\"a\nb\"\n2\n");
+        let error = diff_records_with(&good, &ragged, &options).unwrap_err().to_string();
+        assert!(
+            error.contains("line 4") && error.contains("expected 2 fields, found 1"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn csv_problems_are_reported_with_the_file_the_line_and_the_column() {
+        let dir = Dir::new();
+        let ok = dir.text("ok.csv", "id,v\n1,a\n");
+        let options = with_csv(RecordOptions::new().key("id"), CsvOptions::new());
+        let message = |content: &str, options: &RecordOptions| {
+            let bad = dir.text("bad.csv", content);
+            diff_records_with(&ok, &bad, options).unwrap_err().to_string()
+        };
+        let error = message("id,v\n1,a\n2\n", &options);
+        assert!(
+            error.contains("bad.csv")
+                && error.contains("line 3")
+                && error.contains("expected 2 fields, found 1"),
+            "{error}"
+        );
+        let error = message("id,v\n1,a,extra\n", &options);
+        assert!(error.contains("line 2") && error.contains("found 3"), "{error}");
+        let error = message("id,id\n1,a\n", &options);
+        assert!(
+            error.contains("line 1") && error.contains("`id`") && error.contains("twice"),
+            "{error}"
+        );
+        let error = message("id,\n1,a\n", &options);
+        assert!(error.contains("line 1") && error.contains("empty"), "{error}");
+        // The key column has to exist, and be named as the user wrote it.
+        let error = message("code,v\n1,a\n", &options);
+        assert!(error.contains("`id`") && error.contains("bad.csv"), "{error}");
+        // CSV rows are flat: a nested pointer cannot name anything.
+        let nested = with_csv(RecordOptions::new().key("/a/b"), CsvOptions::new());
+        let error = diff_records_with(&ok, &ok, &nested).unwrap_err().to_string();
+        assert!(error.contains("flat") || error.contains("nested"), "{error}");
+        // Not valid UTF-8.
+        let invalid = dir.path("invalid.csv");
+        std::fs::write(&invalid, b"id,v\n1,\xff\xfe\n").unwrap();
+        let error = diff_records_with(&ok, &invalid, &options).unwrap_err().to_string();
+        assert!(error.contains("line 2") && error.contains("UTF-8"), "{error}");
+    }
+
+    #[test]
+    fn a_cell_that_does_not_fit_its_column_type_is_an_error_naming_the_cell() {
+        let dir = Dir::new();
+        let ok = dir.text("ok.csv", "id,n\n1,5\n");
+        for (kind, bad_cell, word) in [
+            (ColumnType::Int, "five", "integer"),
+            (ColumnType::Int, "1.5", "integer"),
+            (ColumnType::Float, "x", "number"),
+            (ColumnType::Float, "NaN", "number"),
+            (ColumnType::Bool, "yes", "boolean"),
+            (ColumnType::Json, "{oops", "JSON"),
+        ] {
+            let bad = dir.text("bad.csv", &format!("id,n\n1,{bad_cell}\n"));
+            let options =
+                with_csv(RecordOptions::new().key("id"), CsvOptions::new().column("n", kind));
+            // A cell of the right type for the file that is fine.
+            let fine = match kind {
+                ColumnType::Bool => "true",
+                ColumnType::Json => "5",
+                _ => "1",
+            };
+            let ok_typed = dir.text("ok2.csv", &format!("id,n\n1,{fine}\n"));
+            let error = diff_records_with(&ok_typed, &bad, &options).unwrap_err().to_string();
+            assert!(
+                error.contains("line 2")
+                    && error.contains("`n`")
+                    && error.contains(bad_cell)
+                    && error.contains(word),
+                "{kind:?} {bad_cell}: {error}"
+            );
+        }
+        // A typed column that is not in the file is a mistake worth saying.
+        let options = with_csv(
+            RecordOptions::new().key("id"),
+            CsvOptions::new().column("nope", ColumnType::Int),
+        );
+        let error = diff_records_with(&ok, &ok, &options).unwrap_err().to_string();
+        assert!(error.contains("`nope`") && error.contains("ok.csv"), "{error}");
+    }
+
+    #[test]
+    fn composite_keys_duplicate_policies_and_whole_rows_work_for_csv_too() {
+        let old = vec![
+            vec!["1", "eu", "x", "1"],
+            vec!["1", "us", "y", "2"],
+            vec!["2", "eu", "z", "3"],
+            vec!["1", "eu", "dup", "4"],
+        ];
+        let new = vec![
+            vec!["2", "eu", "z", "3"],
+            vec!["1", "us", "y", "9"],
+            vec!["1", "eu", "x", "1"],
+            vec!["1", "eu", "dup2", "4"],
+        ];
+        let header = ["id", "region", "note", "score"];
+        for options in [
+            RecordOptions::new().key("id").key("region").duplicates(Duplicates::First),
+            RecordOptions::new().key("id").key("region").duplicates(Duplicates::Last),
+            RecordOptions::new().key("id").key("region").duplicates(Duplicates::Occurrence),
+            RecordOptions::new().whole_row(),
+            RecordOptions::new()
+                .key("id")
+                .key("region")
+                .duplicates(Duplicates::Last)
+                .diff(DiffOptions::new().ignore_path("/*/note")),
+        ] {
+            assert_csv_matches_oracle(
+                &header,
+                &old,
+                &new,
+                &with_csv(options, CsvOptions::new()),
+                &[],
+            );
+        }
+    }
+
+    #[test]
+    fn random_csv_files_match_the_oracle() {
+        // xorshift: deterministic, no extra dependencies.
+        let mut state = 0xA4093822299F31D0u64;
+        let mut next = move |n: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % n
+        };
+        const CELLS: [&str; 9] =
+            ["", "a", "b c", "x,y", "q\"r", "two\nlines", "ünï", "007", " pad "];
+        let header = ["id", "a", "b", "c"];
+        for round in 0..150 {
+            let make = |next: &mut dyn FnMut(u64) -> u64| -> Vec<Vec<String>> {
+                let mut ids: Vec<u64> = (0..9).filter(|_| next(3) != 0).collect();
+                for i in (1..ids.len()).rev() {
+                    ids.swap(i, next(i as u64 + 1) as usize);
+                }
+                ids.into_iter()
+                    .map(|id| {
+                        let mut row = vec![id.to_string()];
+                        row.extend((0..3).map(|_| CELLS[next(9) as usize].to_string()));
+                        row
+                    })
+                    .collect()
+            };
+            let (old, new) = (make(&mut next), make(&mut next));
+            fn as_refs(rows: &[Vec<String>]) -> Vec<Vec<&str>> {
+                rows.iter().map(|r| r.iter().map(String::as_str).collect()).collect()
+            }
+            let options = with_csv(RecordOptions::new().key("id"), CsvOptions::new());
+            assert_csv_matches_oracle(&header, &as_refs(&old), &as_refs(&new), &options, &[]);
+            let _ = round;
+        }
+    }
+
+    #[test]
+    fn many_columns_and_rows_are_fine() {
+        let columns: Vec<String> = (0..60).map(|i| format!("c{i}")).collect();
+        let header: Vec<&str> = columns.iter().map(String::as_str).collect();
+        let cells: Vec<Vec<String>> =
+            (0..500).map(|r| (0..60).map(|c| format!("{r}-{c}")).collect()).collect();
+        let old: Vec<Vec<&str>> =
+            cells.iter().map(|r| r.iter().map(String::as_str).collect()).collect();
+        let mut new = old.clone();
+        new[250][59] = "changed";
+        let options = with_csv(RecordOptions::new().key("c0"), CsvOptions::new());
+        let ops = assert_csv_matches_oracle(&header, &old, &new, &options, &[]);
+        assert_eq!(ops.len(), 1);
+    }
+
+    #[test]
+    fn identical_cells_under_a_renamed_column_are_not_equal_rows() {
+        // The bytes of the rows are the same; only the header differs, so a row
+        // hash that ignored the header would call them equal and skip them.
+        let dir = Dir::new();
+        let old = dir.text("old.csv", "id,price\n1,10\n2,20\n");
+        let new = dir.text("new.csv", "id,cost\n1,10\n2,20\n");
+        let options = with_csv(RecordOptions::new().key("id"), CsvOptions::new());
+        let ops = diff_records_with(&old, &new, &options).unwrap();
+        let paths: Vec<_> = ops.iter().map(|o| (o.op.as_str(), o.path.as_str())).collect();
+        assert_eq!(
+            paths,
+            [
+                ("remove", "/0/price"),
+                ("add", "/0/cost"),
+                ("remove", "/1/price"),
+                ("add", "/1/cost")
+            ]
+        );
+        // The same goes for a column that only changes type.
+        let typed = with_csv(
+            RecordOptions::new().key("id"),
+            CsvOptions::new().column("price", ColumnType::Int),
+        );
+        let same = dir.text("same.csv", "id,price\n1,10\n2,20\n");
+        assert!(diff_records_with(&old, &same, &options).unwrap().is_empty());
+        assert!(diff_records_with(&old, &same, &typed).unwrap().is_empty());
+    }
+
+    #[test]
+    fn integers_beyond_i64_are_kept_exactly() {
+        let types = [("id", ColumnType::Int)];
+        let big = "18446744073709551615";
+        let old = vec![vec![big, "a", "", ""], vec!["-9223372036854775808", "b", "", ""]];
+        let new = vec![vec![big, "A", "", ""], vec!["-9223372036854775808", "b", "", ""]];
+        let options = with_csv(RecordOptions::new().key("id"), csv_options(&types));
+        let ops = assert_csv_matches_oracle(&HEADER, &old, &new, &options, &types);
+        assert_eq!(ops.len(), 1);
+    }
+
+    #[test]
+    fn a_quoted_empty_cell_in_a_one_column_file_is_a_row_but_a_blank_line_is_not() {
+        let dir = Dir::new();
+        let with_empty = dir.text("a.csv", "id\nx\n\"\"\n\ny\n");
+        let without = dir.text("b.csv", "id\nx\n\ny\n");
+        let options = with_csv(RecordOptions::new().key("id"), CsvOptions::new());
+        let ops = diff_records_with(&with_empty, &without, &options).unwrap();
+        // Rows are x, "" and y; dropping the empty one is a single removal at /1.
+        assert_eq!(
+            ops.iter().map(|o| (o.op.as_str(), o.path.as_str())).collect::<Vec<_>>(),
+            [("remove", "/1")]
+        );
+    }
+
+    #[test]
+    fn a_ragged_row_is_an_error_even_when_it_is_the_same_in_both_files() {
+        // Equal rows are never read back, so only checking every row while indexing
+        // catches this.
+        let dir = Dir::new();
+        let ragged = dir.text("ragged.csv", "id,v\n1,a\n2\n3,c\n");
+        let options = with_csv(RecordOptions::new().key("id"), CsvOptions::new());
+        let error = diff_records_with(&ragged, &ragged, &options).unwrap_err().to_string();
+        assert!(
+            error.contains("line 3") && error.contains("expected 2 fields, found 1"),
+            "{error}"
+        );
     }
 }

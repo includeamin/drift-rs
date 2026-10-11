@@ -13,7 +13,11 @@
 //! rows as arrays matched by that key: the order of operations comes from the same
 //! planner, so the two can be used interchangeably.
 
+#[cfg(feature = "csv")]
+mod csv;
 mod ndjson;
+#[cfg(feature = "csv")]
+pub use csv::{ColumnType, CsvOptions};
 
 use crate::diff::{plan_keyed, walk, Context, KeyedStep};
 use crate::{join_pointer, split_pointer, Delta, DiffOptions, DriftError, Operation};
@@ -44,6 +48,19 @@ pub enum Duplicates {
     /// Match the nth row with a key in one file to the nth row with that key in
     /// the other. The default for whole-row keys, where identical rows are normal.
     Occurrence,
+}
+
+/// How the rows of a file are stored.
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub enum RecordFormat {
+    /// One JSON value per line (NDJSON, JSON Lines). The default.
+    #[default]
+    Ndjson,
+    /// Delimited text with a header row: CSV, TSV and the like. Each row is read as
+    /// an object of its cells, keyed by the column names. Needs the `csv` feature.
+    #[cfg(feature = "csv")]
+    Csv(CsvOptions),
 }
 
 /// How [`diff_records_with`] matches and compares rows.
@@ -77,6 +94,8 @@ pub struct RecordOptions {
     pub duplicates: Option<Duplicates>,
     /// How rows are compared once matched, and what is left out.
     pub diff: DiffOptions,
+    /// How the two files store their rows.
+    pub format: RecordFormat,
 }
 
 impl RecordOptions {
@@ -106,6 +125,12 @@ impl RecordOptions {
     /// Sets how matched rows are compared (ignored paths, keys of inner arrays).
     pub fn diff(mut self, options: DiffOptions) -> Self {
         self.diff = options;
+        self
+    }
+
+    /// Sets how the files store their rows; NDJSON unless told otherwise.
+    pub fn format(mut self, format: RecordFormat) -> Self {
+        self.format = format;
         self
     }
 }
@@ -163,8 +188,8 @@ pub fn diff_records_with(old: &Path, new: &Path, options: &RecordOptions) -> Res
     } else {
         Duplicates::Error
     });
-    let old_rows = Rows::index(old, &spec)?.resolve(policy, &spec)?;
-    let new_rows = Rows::index(new, &spec)?.resolve(policy, &spec)?;
+    let old_rows = Rows::index(old, &spec, &options.format)?.resolve(policy, &spec)?;
+    let new_rows = Rows::index(new, &spec, &options.format)?.resolve(policy, &spec)?;
     let old_order = old_rows.sorted();
     let matches: Vec<Option<usize>> = (0..new_rows.len())
         .map(|row| {
@@ -307,9 +332,18 @@ enum Fault {
     Json(serde_json::Error),
 }
 
+/// What a file's rows look like, which is needed to read one back.
+enum Source {
+    Ndjson,
+    /// The header of the file, with its column types.
+    #[cfg(feature = "csv")]
+    Csv(csv::Layout),
+}
+
 /// A file of records, indexed: one entry per row, in file order.
 struct Rows {
     path: PathBuf,
+    source: Source,
     whole_row: bool,
     /// A 128-bit hash of each row's key. The number 1 and the string "1" are
     /// different keys.
@@ -398,7 +432,15 @@ impl Rows {
         ))
     }
 
-    fn index(path: &Path, spec: &KeySpec) -> Result<Rows> {
+    fn index(path: &Path, spec: &KeySpec, format: &RecordFormat) -> Result<Rows> {
+        match format {
+            RecordFormat::Ndjson => Rows::index_ndjson(path, spec),
+            #[cfg(feature = "csv")]
+            RecordFormat::Csv(options) => csv::index(path, spec, options),
+        }
+    }
+
+    fn index_ndjson(path: &Path, spec: &KeySpec) -> Result<Rows> {
         let end = open(path)?
             .metadata()
             .map_err(|e| DriftError::Io(format!("{}: {e}", path.display())))?
@@ -427,6 +469,7 @@ impl Rows {
 
         let mut rows = Rows {
             path: path.to_path_buf(),
+            source: Source::Ndjson,
             whole_row: spec.whole_row,
             keys: Vec::new(),
             hashes: Vec::new(),
@@ -543,7 +586,15 @@ impl Rows {
         file.seek(SeekFrom::Start(start))
             .and_then(|_| file.read_exact(&mut buffer))
             .map_err(|e| DriftError::Io(format!("{}: {e}", self.path.display())))?;
-        serde_json::from_slice(trim(&buffer)).map_err(|e| self.error_at(start, e))
+        match &self.source {
+            Source::Ndjson => {
+                serde_json::from_slice(trim(&buffer)).map_err(|e| self.error_at(start, e))
+            }
+            #[cfg(feature = "csv")]
+            Source::Csv(layout) => {
+                csv::parse_row(&buffer, layout).map_err(|e| self.error_at(start, e))
+            }
+        }
     }
 }
 
