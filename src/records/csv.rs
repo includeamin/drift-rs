@@ -163,6 +163,18 @@ pub(super) fn parse_row(bytes: &[u8], layout: &Layout) -> std::result::Result<Va
     }
 }
 
+/// The length of the row at the start of `bytes`, terminator included, or `None`
+/// if `bytes` ends before the row does (or just as it does, which cannot be told
+/// from a row that goes on).
+pub(super) fn record_len(bytes: &[u8], layout: &Layout) -> Option<usize> {
+    let mut reader = layout.reader(bytes);
+    let mut record = csv::ByteRecord::new();
+    match reader.read_byte_record(&mut record) {
+        Ok(true) => Some(reader.position().byte() as usize).filter(|&used| used < bytes.len()),
+        _ => None,
+    }
+}
+
 /// Indexes a CSV file: one entry per row, as for NDJSON.
 pub(super) fn index(path: &Path, spec: &KeySpec, options: &CsvOptions) -> Result<Rows> {
     let mut rows = Rows {

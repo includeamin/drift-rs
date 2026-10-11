@@ -21,7 +21,7 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Command {
-    Diff(DiffArgs),
+    Diff(Box<DiffArgs>),
     Patch(PatchArgs),
     Paths(PathsArgs),
     Check(CheckArgs),
@@ -89,6 +89,16 @@ struct DiffArgs {
     /// tab for .tsv). One character, or tab, comma, semicolon or pipe.
     #[arg(long)]
     delimiter: Option<String>,
+    /// Record files: diff files too big for memory, sorting through temporary
+    /// files with about this much memory (a number of bytes, or with a K, M or
+    /// G suffix: 512M). Slower than the default. Needs rows that are in both
+    /// files to be in the same order in each.
+    #[arg(long = "memory-limit")]
+    memory_limit: Option<String>,
+    /// Record files: where `--memory-limit` puts its temporary files (default:
+    /// the system's temporary directory).
+    #[arg(long = "temp-dir")]
+    temp_dir: Option<String>,
     #[command(flatten)]
     output: OutputArgs,
 }
@@ -353,6 +363,26 @@ fn records_kind(path: &str) -> Option<RecordsKind> {
     }
 }
 
+/// `--memory-limit`: a number of bytes, optionally with a K, M or G suffix.
+fn parse_size(text: &str) -> Result<usize, Box<dyn std::error::Error>> {
+    let wrong = || format!("--memory-limit must be a size such as 512M, 2G or 65536, not `{text}`");
+    let lower = text.trim().to_ascii_lowercase();
+    let digits = lower.trim_end_matches(|c: char| c.is_ascii_alphabetic());
+    let unit: u64 = match &lower[digits.len()..] {
+        "" | "b" => 1,
+        "k" | "kb" | "kib" => 1 << 10,
+        "m" | "mb" | "mib" => 1 << 20,
+        "g" | "gb" | "gib" => 1 << 30,
+        _ => return Err(wrong().into()),
+    };
+    let number: u64 = digits.parse().map_err(|_| wrong())?;
+    let bytes = number.checked_mul(unit).ok_or_else(wrong)?;
+    if bytes == 0 {
+        return Err(wrong().into());
+    }
+    Ok(usize::try_from(bytes).unwrap_or(usize::MAX))
+}
+
 /// `--delimiter`: one character, or a word for the common ones.
 fn parse_delimiter(text: &str) -> Result<u8, Box<dyn std::error::Error>> {
     match text {
@@ -408,6 +438,9 @@ fn records_inputs(
         }
         if csv_only {
             return Err("--types and --delimiter apply only to CSV and TSV files".into());
+        }
+        if args.memory_limit.is_some() || args.temp_dir.is_some() {
+            return Err("--memory-limit and --temp-dir apply only to record files (NDJSON, CSV or TSV: .ndjson, .jsonl, .csv or .tsv)".into());
         }
         return Ok(None);
     }
@@ -504,6 +537,17 @@ fn cmd_diff(args: DiffArgs) -> Result<i32, Box<dyn std::error::Error>> {
         }
         if let Some(policy) = args.duplicates {
             options = options.duplicates(policy.into());
+        }
+        if let Some(limit) = &args.memory_limit {
+            options = options.memory_limit(parse_size(limit)?);
+        }
+        if let Some(dir) = &args.temp_dir {
+            if args.memory_limit.is_none() {
+                return Err(
+                    "--temp-dir is for --memory-limit, which sorts through temporary files".into(),
+                );
+            }
+            options = options.temp_dir(dir);
         }
         let filter = drift::OperationFilter::new(
             &args.paths,
@@ -629,7 +673,7 @@ fn cmd_compose(args: ComposeArgs) -> Result<i32, Box<dyn std::error::Error>> {
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let command = Cli::parse().command;
     let code = match command {
-        Command::Diff(args) => cmd_diff(args)?,
+        Command::Diff(args) => cmd_diff(*args)?,
         Command::Patch(args) => cmd_patch(args)?,
         Command::Paths(args) => cmd_paths(args)?,
         Command::Check(args) => cmd_check(args)?,
@@ -742,7 +786,7 @@ mod tests {
 
     fn run_cli(args: &[&str]) -> Result<i32, Box<dyn std::error::Error>> {
         match Cli::try_parse_from(args)?.command {
-            Command::Diff(args) => cmd_diff(args),
+            Command::Diff(args) => cmd_diff(*args),
             Command::Patch(args) => cmd_patch(args),
             Command::Invert(args) => cmd_invert(args),
             Command::Compose(args) => cmd_compose(args),
@@ -1014,6 +1058,59 @@ mod tests {
             "sometimes"
         ])
         .is_err());
+    }
+
+    #[test]
+    fn sizes_are_bytes_or_have_a_unit() {
+        assert_eq!(parse_size("65536").unwrap(), 65536);
+        assert_eq!(parse_size("64k").unwrap(), 64 << 10);
+        assert_eq!(parse_size("512M").unwrap(), 512 << 20);
+        assert_eq!(parse_size("2GiB").unwrap(), 2 << 30);
+        for wrong in ["", "M", "0", "-1", "1.5G", "12X", "99999999999999999999G"] {
+            assert!(parse_size(wrong).is_err(), "{wrong}");
+        }
+    }
+
+    #[test]
+    fn a_memory_limit_gives_the_same_operations_and_leaves_no_files() {
+        let dir = Scratch::new("ndjson-limit");
+        let rows = |changed: bool| -> String {
+            (0..300)
+                .filter(|i| i % 9 != 0)
+                .map(|i| {
+                    format!("{{\"id\":{i},\"v\":{}}}\n", if changed && i % 4 == 0 { 1 } else { 0 })
+                })
+                .collect()
+        };
+        let (old, new) =
+            (dir.file("old.ndjson", &rows(false)), dir.file("new.ndjson", &rows(true)));
+        let plain = ndjson_ops(&[&old, &new, "--array-key", "id"], &dir.path("a.json"));
+        assert!(plain.len() > 20);
+        let temp = dir.path("tmp");
+        std::fs::create_dir_all(&temp).unwrap();
+        let limited = ndjson_ops(
+            &[&old, &new, "--array-key", "id", "--memory-limit", "2k", "--temp-dir", &temp],
+            &dir.path("b.json"),
+        );
+        assert_eq!(limited, plain);
+        assert_eq!(std::fs::read_dir(&temp).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn memory_limit_and_temp_dir_are_refused_where_they_do_nothing() {
+        let dir = Scratch::new("limit-refused");
+        let ndjson = dir.file("a.ndjson", "{\"id\":1}\n");
+        let json = dir.file("a.json", "{\"a\":1}");
+        let run = |args: &[&str]| {
+            let mut full = vec!["drift", "diff", "-o", "/dev/null"];
+            full.extend_from_slice(args);
+            run_cli(&full).unwrap_err().to_string()
+        };
+        assert!(run(&[&json, &json, "--memory-limit", "1M"]).contains("apply only to record files"));
+        assert!(run(&[&ndjson, &ndjson, "--array-key", "id", "--temp-dir", "/tmp"])
+            .contains("--temp-dir is for --memory-limit"));
+        assert!(run(&[&ndjson, &ndjson, "--array-key", "id", "--memory-limit", "lots"])
+            .contains("--memory-limit must be a size"));
     }
 
     #[test]

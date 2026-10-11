@@ -1240,3 +1240,324 @@ fn an_error_from_the_callback_stops_the_diff_and_is_returned() {
     assert!(matches!(&result, Err(DriftError::Io(m)) if m == "the disk is full"), "{result:?}");
     assert_eq!(calls, 3, "no operation is handed over after the callback failed");
 }
+
+/// Diffs with a budget for sorting instead of an index, through temporary files.
+mod bounded {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// A directory for temporary files inside the scratch one, so leftovers show.
+    fn scratch(dir: &Dir) -> PathBuf {
+        let path = dir.0.join("tmp");
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn leftovers(path: &Path) -> Vec<String> {
+        std::fs::read_dir(path)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect()
+    }
+
+    fn bounded(options: &RecordOptions, limit: usize, dir: &Dir) -> RecordOptions {
+        options.clone().memory_limit(limit).temp_dir(scratch(dir))
+    }
+
+    fn has_move(operations: &[Delta]) -> bool {
+        operations.iter().any(|operation| operation.op == Operation::Move)
+    }
+
+    #[test]
+    fn random_files_give_the_in_memory_diff_and_only_moves_need_the_memory() {
+        // xorshift: deterministic, no extra dependencies.
+        let mut state = 0x2545F4914F6CDD1Du64;
+        let mut next = move |n: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % n
+        };
+        let configs = [
+            RecordOptions::new().key("id").key("region"),
+            RecordOptions::new().key("/meta/n").duplicates(Duplicates::First),
+            RecordOptions::new().key("id").duplicates(Duplicates::Last),
+            RecordOptions::new().key("id").key("region").duplicates(Duplicates::Occurrence),
+            RecordOptions::new().key("id").duplicates(Duplicates::Occurrence),
+            RecordOptions::new().whole_row(),
+            RecordOptions::new().whole_row().diff(DiffOptions::new().ignore_path("/*/v")),
+        ];
+        let (mut sorted_out, mut needed_moves) = (0, 0);
+        for round in 0..400 {
+            let options = &configs[round % configs.len()];
+            let unique = options.duplicates.is_none() && !options.whole_row;
+            let in_order = round % 2 == 0;
+            let make = |next: &mut dyn FnMut(u64) -> u64| -> Vec<Value> {
+                let mut rows: Vec<Value> = (0..next(14))
+                    .map(|_| {
+                        let id = next(6);
+                        let region = ["eu", "us"][next(2) as usize];
+                        json!({"id": id, "region": region, "v": next(3), "meta": {"n": id}})
+                    })
+                    .collect();
+                if unique {
+                    let mut seen = std::collections::HashSet::new();
+                    rows.retain(|r| seen.insert((r["id"].clone(), r["region"].clone())));
+                }
+                if in_order {
+                    rows.sort_by_key(|r| r["id"].as_u64());
+                }
+                rows
+            };
+            let (old, new) = (make(&mut next), make(&mut next));
+            let dir = Dir::new();
+            let (old_file, new_file) = (dir.rows("o.ndjson", &old), dir.rows("n.ndjson", &new));
+            let expected = diff_records_with(&old_file, &new_file, options).unwrap();
+
+            // Room for the rows in memory: always the in-memory answer.
+            let roomy = diff_records_with(&old_file, &new_file, &bounded(options, 1600, &dir));
+            assert_eq!(roomy.unwrap(), expected, "roomy, round {round}: {old:?} -> {new:?}");
+
+            // No room: the same answer unless it needs moves, which is then refused.
+            let strict = diff_records_with(&old_file, &new_file, &bounded(options, 400, &dir));
+            let fits = (old.len() + new.len()) * 64 <= 400;
+            match strict {
+                Ok(operations) => {
+                    assert_eq!(operations, expected, "round {round}: {old:?} -> {new:?}");
+                    assert!(fits || !has_move(&expected), "round {round}: moves went unnoticed");
+                    sorted_out += 1;
+                }
+                Err(error) => {
+                    assert!(has_move(&expected) && !fits, "round {round}: {error}");
+                    assert!(error.to_string().contains("different order"), "{error}");
+                    needed_moves += 1;
+                }
+            }
+            assert_eq!(leftovers(&dir.0.join("tmp")), Vec::<String>::new(), "round {round}");
+        }
+        assert!(sorted_out > 100 && needed_moves > 20, "{sorted_out} {needed_moves}");
+    }
+
+    /// A file of `count` rows with payloads that make it several runs long.
+    fn big(count: u64, changed: impl Fn(u64) -> bool, gone: impl Fn(u64) -> bool) -> Vec<Value> {
+        (0..count)
+            .filter(|&i| !gone(i))
+            .map(|i| {
+                let v = if changed(i) { i + 1 } else { i };
+                json!({"id": i * 3 + 1, "v": v, "pad": "x".repeat(40 + (i % 17) as usize)})
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_file_many_times_the_budget_gives_the_in_memory_diff() {
+        let old = big(20_000, |_| false, |_| false);
+        let new = {
+            let mut rows = big(20_000, |i| i % 7 == 0, |i| i % 11 == 0);
+            rows.insert(5, json!({"id": 2, "v": 0, "pad": ""}));
+            rows.push(json!({"id": 1_000_000, "v": 0, "pad": ""}));
+            rows
+        };
+        let dir = Dir::new();
+        let (old_file, new_file) = (dir.rows("o.ndjson", &old), dir.rows("n.ndjson", &new));
+        let options = RecordOptions::new().key("id");
+        let expected = diff_records_with(&old_file, &new_file, &options).unwrap();
+        assert!(expected.len() > 4000);
+        // 64 KiB: a few hundred rows per run, dozens of runs a file.
+        let got = diff_records_with(&old_file, &new_file, &bounded(&options, 64 * 1024, &dir));
+        assert_eq!(got.unwrap(), expected);
+        assert!(leftovers(&dir.0.join("tmp")).is_empty());
+    }
+
+    #[test]
+    fn repeats_that_are_left_out_do_not_count_in_the_row_numbers_of_either_file() {
+        let row = |id: u64, v: u64| json!({"id": id, "v": v});
+        let old = [row(1, 1), row(1, 2), row(2, 1), row(3, 1), row(3, 2), row(3, 3), row(4, 1)];
+        let new = [row(0, 0), row(2, 9), row(2, 8), row(3, 1), row(5, 1), row(5, 2)];
+        let dir = Dir::new();
+        let (old_file, new_file) = (dir.rows("o.ndjson", &old), dir.rows("n.ndjson", &new));
+        for policy in [Duplicates::First, Duplicates::Last] {
+            let options = RecordOptions::new().key("id").duplicates(policy);
+            let expected = diff_records_with(&old_file, &new_file, &options).unwrap();
+            for limit in [100, 4000] {
+                let got = diff_records_with(&old_file, &new_file, &bounded(&options, limit, &dir));
+                assert_eq!(got.unwrap(), expected, "{policy:?} {limit}");
+            }
+        }
+    }
+
+    #[test]
+    fn rows_are_read_back_across_the_edges_of_the_read_window() {
+        // Rows of every length from a few bytes to far more than a window chunk.
+        let rows = |changed: bool| -> Vec<Value> {
+            (0..300u64)
+                .map(|i| {
+                    let pad = "ab\u{e9}\n\"".repeat((i * i % 5000) as usize);
+                    json!({"id": i, "v": u64::from(changed && i % 3 == 0), "pad": pad})
+                })
+                .collect()
+        };
+        let (old, new) = (rows(false), rows(true));
+        let dir = Dir::new();
+        let (old_file, new_file) = (dir.rows("o.ndjson", &old), dir.rows("n.ndjson", &new));
+        let options = RecordOptions::new().key("id");
+        let expected = diff_records_with(&old_file, &new_file, &options).unwrap();
+        assert_eq!(expected.len(), 100);
+        let got = diff_records_with(&old_file, &new_file, &bounded(&options, 8000, &dir));
+        assert_eq!(got.unwrap(), expected);
+    }
+
+    #[test]
+    fn temporary_files_are_removed_when_the_diff_fails_or_is_stopped() {
+        let old: Vec<Value> = (0..200).map(|i| row(i, i)).collect();
+        let new: Vec<Value> = (0..200).map(|i| row(i, i + 1)).collect();
+        let dir = Dir::new();
+        let (old_file, new_file) = (dir.rows("o.ndjson", &old), dir.rows("n.ndjson", &new));
+        let options = bounded(&RecordOptions::new().key("id"), 800, &dir);
+
+        let mut calls = 0;
+        let stopped = diff_records_each(&old_file, &new_file, &options, |_| {
+            calls += 1;
+            if calls == 5 {
+                Err(DriftError::Io("stop".into()))
+            } else {
+                Ok(())
+            }
+        });
+        assert!(matches!(stopped, Err(DriftError::Io(m)) if m == "stop"));
+        assert_eq!(calls, 5);
+        assert!(leftovers(&dir.0.join("tmp")).is_empty());
+
+        let repeated = dir.rows("r.ndjson", &[row(1, 1), row(2, 2), row(1, 3)]);
+        assert!(diff_records_with(&old_file, &repeated, &options).is_err());
+        assert!(leftovers(&dir.0.join("tmp")).is_empty());
+
+        // And that a diff which sorts on disk really does use the directory.
+        let used = std::cell::Cell::new(false);
+        diff_records_each(&old_file, &new_file, &options, |_| {
+            used.set(used.get() || !leftovers(&dir.0.join("tmp")).is_empty());
+            Ok(())
+        })
+        .unwrap();
+        assert!(used.get(), "the sort should have gone to disk");
+    }
+
+    #[test]
+    fn a_missing_temporary_directory_is_an_error() {
+        let dir = Dir::new();
+        let file = dir.rows("o.ndjson", &[row(1, 1)]);
+        let options =
+            RecordOptions::new().key("id").memory_limit(1000).temp_dir(dir.0.join("nowhere"));
+        let error = diff_records_with(&file, &file, &options).unwrap_err();
+        assert!(matches!(&error, DriftError::Io(m) if m.contains("nowhere")), "{error}");
+    }
+
+    #[test]
+    fn problems_with_the_data_read_the_same_as_without_a_limit() {
+        let dir = Dir::new();
+        let good = dir.text("good.ndjson", "{\"id\":1}\n{\"id\":2}\n");
+        let bad = [
+            ("dup.ndjson", "{\"id\":1}\n{\"id\":2}\n{\"id\":1}\n"),
+            ("nokey.ndjson", "{\"id\":1}\n{\"x\":2}\n"),
+            ("badkey.ndjson", "{\"id\":1}\n{\"id\":[2]}\n"),
+            ("json.ndjson", "{\"id\":1}\n{\"id\":\n"),
+            ("scalar.ndjson", "{\"id\":1}\n5\n"),
+        ];
+        for (name, text) in bad {
+            let file = dir.text(name, text);
+            let options = RecordOptions::new().key("id");
+            for (old, new) in [(&file, &good), (&good, &file)] {
+                let plain = diff_records_with(old, new, &options).unwrap_err().to_string();
+                let limited =
+                    diff_records_with(old, new, &bounded(&options, 500, &dir)).unwrap_err();
+                assert_eq!(limited.to_string(), plain, "{name}");
+            }
+        }
+        let missing = dir.0.join("missing.ndjson");
+        let options = bounded(&RecordOptions::new().key("id"), 500, &dir);
+        assert!(matches!(diff_records_with(&missing, &good, &options), Err(DriftError::Io(_))));
+    }
+
+    #[cfg(feature = "csv")]
+    mod csv_files {
+        use super::*;
+
+        fn cells(i: u64, changed: bool) -> Vec<String> {
+            let note =
+                ["plain", "has,comma", "has \"quote\"", "two\nlines", "ünï"][(i % 5) as usize];
+            vec![
+                (i * 2).to_string(),
+                if changed { "changed".into() } else { "same".into() },
+                format!("{note} {}", "x".repeat((i % 40) as usize)),
+            ]
+        }
+
+        fn write(dir: &Dir, name: &str, rows: impl Iterator<Item = Vec<String>>) -> PathBuf {
+            let mut writer = ::csv::Writer::from_writer(Vec::new());
+            writer.write_record(["id", "state", "note"]).unwrap();
+            for row in rows {
+                writer.write_record(&row).unwrap();
+            }
+            dir.text(name, &String::from_utf8(writer.into_inner().unwrap()).unwrap())
+        }
+
+        #[test]
+        fn csv_files_give_the_in_memory_diff_through_the_sort() {
+            let dir = Dir::new();
+            let old = write(&dir, "o.csv", (0..6000).map(|i| cells(i, false)));
+            let new = write(
+                &dir,
+                "n.csv",
+                (0..6000).filter(|i| i % 13 != 0).map(|i| cells(i, i % 5 == 0)),
+            );
+            let base = RecordOptions::new()
+                .key("id")
+                .format(RecordFormat::Csv(CsvOptions::new().column("id", ColumnType::Int)));
+            let expected = diff_records_with(&old, &new, &base).unwrap();
+            assert!(expected.len() > 1000);
+            let got = diff_records_with(&old, &new, &bounded(&base, 40_000, &dir));
+            assert_eq!(got.unwrap(), expected);
+            assert!(leftovers(&dir.0.join("tmp")).is_empty());
+        }
+
+        #[test]
+        fn csv_whole_rows_and_repeats_work_through_the_sort() {
+            let dir = Dir::new();
+            let rows = |extra: bool| {
+                let mut all: Vec<Vec<String>> = (0..50).map(|i| cells(i % 20, false)).collect();
+                if extra {
+                    all.push(cells(3, true));
+                }
+                all.into_iter()
+            };
+            let (old, new) = (write(&dir, "o.csv", rows(false)), write(&dir, "n.csv", rows(true)));
+            for base in [RecordOptions::new().whole_row(), RecordOptions::new().key("id")] {
+                let base = base
+                    .duplicates(Duplicates::Occurrence)
+                    .format(RecordFormat::Csv(CsvOptions::new()));
+                let expected = diff_records_with(&old, &new, &base).unwrap();
+                let got = diff_records_with(&old, &new, &bounded(&base, 600, &dir));
+                assert_eq!(got.unwrap(), expected);
+            }
+        }
+
+        #[test]
+        fn csv_problems_read_the_same_as_without_a_limit() {
+            let dir = Dir::new();
+            let good = dir.text("good.csv", "id,v\n1,a\n2,b\n");
+            let bad = [
+                ("ragged.csv", "id,v\n1,a\n2\n"),
+                ("dup.csv", "id,v\n1,a\n2,b\n1,c\n"),
+                ("header.csv", "id,id\n1,a\n"),
+            ];
+            for (name, text) in bad {
+                let file = dir.text(name, text);
+                let base =
+                    RecordOptions::new().key("id").format(RecordFormat::Csv(CsvOptions::new()));
+                let plain = diff_records_with(&file, &good, &base).unwrap_err().to_string();
+                let limited = diff_records_with(&file, &good, &bounded(&base, 500, &dir));
+                assert_eq!(limited.unwrap_err().to_string(), plain, "{name}");
+            }
+        }
+    }
+}

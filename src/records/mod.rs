@@ -15,6 +15,7 @@
 
 #[cfg(feature = "csv")]
 mod csv;
+mod external;
 mod ndjson;
 #[cfg(feature = "csv")]
 pub use csv::{ColumnType, CsvOptions};
@@ -96,6 +97,13 @@ pub struct RecordOptions {
     pub diff: DiffOptions,
     /// How the two files store their rows.
     pub format: RecordFormat,
+    /// Keep about this many bytes of rows in memory at a time, sorting on disk the
+    /// rest. `None` keeps an index of every row in memory. See
+    /// [`memory_limit`](Self::memory_limit).
+    pub memory_limit: Option<usize>,
+    /// Where the temporary files of a bounded-memory diff go; the system's
+    /// temporary directory if `None`.
+    pub temp_dir: Option<PathBuf>,
 }
 
 impl RecordOptions {
@@ -131,6 +139,27 @@ impl RecordOptions {
     /// Sets how the files store their rows; NDJSON unless told otherwise.
     pub fn format(mut self, format: RecordFormat) -> Self {
         self.format = format;
+        self
+    }
+
+    /// Diffs with about `bytes` of memory for sorting rows instead of an index of
+    /// every row, so files with more rows than fit in memory can be diffed. Rows
+    /// are sorted by key through temporary files, so it is slower than the default
+    /// (several times for files that would fit), and it is a budget for the sort
+    /// buffers rather than a cap on the whole process.
+    ///
+    /// It needs the rows that are in both files to be in the same order in each,
+    /// which they are when a file is a later version of the other. If they are not
+    /// the diff has to move rows, which needs memory for every row: it is then done
+    /// in memory if the rows seem to fit in `bytes`, and is an error if not.
+    pub fn memory_limit(mut self, bytes: usize) -> Self {
+        self.memory_limit = Some(bytes);
+        self
+    }
+
+    /// Sets the directory for the temporary files of a bounded-memory diff.
+    pub fn temp_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.temp_dir = Some(dir.into());
         self
     }
 }
@@ -227,6 +256,22 @@ pub fn diff_records_each(
     } else {
         Duplicates::Error
     });
+    if let Some(limit) = options.memory_limit {
+        match external::diff(old, new, options, &spec, policy, limit, &mut emit)? {
+            external::Outcome::Done => return Ok(()),
+            external::Outcome::Reordered(rows) => {
+                // What the in-memory diff holds for a row of either file.
+                let needed = rows.saturating_mul(IN_MEMORY_ROW as u64);
+                if needed > limit as u64 {
+                    return Err(DriftError::Parse(format!(
+                        "the rows in both files are in a different order in each, which \
+                         needs memory for every row (about {needed} bytes for {rows} rows) \
+                         and the limit is {limit}"
+                    )));
+                }
+            }
+        }
+    }
     let old_rows = Rows::index(old, &spec, &options.format)?.resolve(policy, &spec)?;
     let new_rows = Rows::index(new, &spec, &options.format)?.resolve(policy, &spec)?;
     let old_order = old_rows.sorted();
@@ -253,6 +298,9 @@ pub fn diff_records_each(
     });
     failure.map_or(Ok(()), Err)
 }
+
+/// Bytes the in-memory diff takes for a row, the index and the planning together.
+const IN_MEMORY_ROW: usize = 64;
 
 struct Files {
     old: File,
@@ -437,6 +485,41 @@ struct Rows {
     /// in the vectors above; `None` means all of them. Row numbers in the diff
     /// count these rows only.
     view: Option<Vec<u32>>,
+}
+
+/// Scans a file of rows one at a time, handing each to `sink`. Returns how to read
+/// a row back, and the length of the file.
+fn scan_file(
+    path: &Path,
+    spec: &KeySpec,
+    format: &RecordFormat,
+    sink: &mut dyn FnMut(Scanned) -> Result<()>,
+) -> Result<(Source, u64)> {
+    match format {
+        RecordFormat::Ndjson => {
+            let end = open(path)?
+                .metadata()
+                .map_err(|e| DriftError::Io(format!("{}: {e}", path.display())))?
+                .len();
+            // The sink's own error, kept aside because a `Failure` cannot carry it.
+            let mut stopped = None;
+            let result = ndjson::scan_part(path, 0, end, spec, &mut |row| {
+                sink(row).map_err(|error| {
+                    stopped = Some(error);
+                    Failure { offset: 0, fault: Fault::Io(String::new()) }
+                })
+            });
+            match result {
+                Ok(()) => Ok((Source::Ndjson, end)),
+                Err(failure) => Err(stopped.unwrap_or_else(|| failure_error(path, spec, failure))),
+            }
+        }
+        #[cfg(feature = "csv")]
+        RecordFormat::Csv(options) => {
+            let (layout, end) = csv::scan(path, spec, options, sink)?;
+            Ok((Source::Csv(layout), end))
+        }
+    }
 }
 
 fn open(path: &Path) -> Result<File> {
