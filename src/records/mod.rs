@@ -182,6 +182,45 @@ pub fn diff_records(
 /// the data (a missing or non-scalar key, a repeated key under the default
 /// policy, a line that is not JSON) are errors naming the file and line.
 pub fn diff_records_with(old: &Path, new: &Path, options: &RecordOptions) -> Result<Vec<Delta>> {
+    let mut operations = Vec::new();
+    diff_records_each(old, new, options, |operation| {
+        operations.push(operation);
+        Ok(())
+    })?;
+    Ok(operations)
+}
+
+/// Like [`diff_records_with`], handing each operation to `emit` as it is worked
+/// out instead of collecting them, in the same order.
+///
+/// The list of operations can be as large as the files, so a caller that writes
+/// them out (to a file, a socket, a terminal) need not hold them all. If `emit`
+/// returns an error the diff stops and that error is returned.
+///
+/// ```
+/// use drift::{diff_records_each, RecordOptions};
+///
+/// let dir = std::env::temp_dir().join(format!("drift-each-{}", std::process::id()));
+/// std::fs::create_dir_all(&dir)?;
+/// let (old, new) = (dir.join("old.ndjson"), dir.join("new.ndjson"));
+/// std::fs::write(&old, "{\"id\":1,\"n\":1}\n{\"id\":2,\"n\":2}\n")?;
+/// std::fs::write(&new, "{\"id\":1,\"n\":5}\n")?;
+///
+/// let mut seen = Vec::new();
+/// diff_records_each(&old, &new, &RecordOptions::new().key("id"), |operation| {
+///     seen.push(format!("{} {}", operation.op.as_str(), operation.path));
+///     Ok(())
+/// })?;
+/// assert_eq!(seen, ["remove /1", "replace /0/n"]);
+/// # std::fs::remove_dir_all(&dir).ok();
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+pub fn diff_records_each(
+    old: &Path,
+    new: &Path,
+    options: &RecordOptions,
+    mut emit: impl FnMut(Delta) -> Result<()>,
+) -> Result<()> {
     let spec = KeySpec::parse(options)?;
     let policy = options.duplicates.unwrap_or(if options.whole_row {
         Duplicates::Occurrence
@@ -204,17 +243,15 @@ pub fn diff_records_with(old: &Path, new: &Path, options: &RecordOptions) -> Res
 
     let mut files = Files { old: open(old)?, new: open(new)? };
     let ctx = Context::new(&options.diff);
-    let mut operations = Vec::new();
     let mut failure = None;
     plan_keyed(old_rows.len(), &matches, |step| {
         if failure.is_none() {
-            if let Err(error) = apply(step, &old_rows, &new_rows, &mut files, &ctx, &mut operations)
-            {
+            if let Err(error) = apply(step, &old_rows, &new_rows, &mut files, &ctx, &mut emit) {
                 failure = Some(error);
             }
         }
     });
-    failure.map_or(Ok(operations), Err)
+    failure.map_or(Ok(()), Err)
 }
 
 struct Files {
@@ -229,12 +266,12 @@ fn apply(
     new: &Rows,
     files: &mut Files,
     ctx: &Context,
-    out: &mut Vec<Delta>,
+    emit: &mut dyn FnMut(Delta) -> Result<()>,
 ) -> Result<()> {
     let at = |index: usize| join_pointer("", &index.to_string());
     match step {
-        KeyedStep::Remove(index) => out.push(Delta::new(Operation::Remove, at(index))),
-        KeyedStep::Move { from, to } => out.push(Delta {
+        KeyedStep::Remove(index) => emit(Delta::new(Operation::Remove, at(index))),
+        KeyedStep::Move { from, to } => emit(Delta {
             op: Operation::Move,
             path: at(to),
             value: None,
@@ -242,7 +279,7 @@ fn apply(
         }),
         KeyedStep::Add(index) => {
             let row = new.read(&mut files.new, index)?;
-            out.push(Delta::with_value(Operation::Add, at(index), row));
+            emit(Delta::with_value(Operation::Add, at(index), row))
         }
         KeyedStep::Pair { old: o, new: n } => {
             // With whole rows as keys, matched rows are equal rows by definition.
@@ -252,11 +289,15 @@ fn apply(
             if !old.whole_row && old.hash(o) != new.hash(n) {
                 let (old_row, new_row) =
                     (old.read(&mut files.old, o)?, new.read(&mut files.new, n)?);
-                walk(&new_row, &old_row, &at(n), ctx, out);
+                let mut operations = Vec::new();
+                walk(&new_row, &old_row, &at(n), ctx, &mut operations);
+                for operation in operations {
+                    emit(operation)?;
+                }
             }
+            Ok(())
         }
     }
-    Ok(())
 }
 
 /// Where the key of a row is: one or more fields or JSON Pointers, or the whole row.

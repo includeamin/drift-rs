@@ -1197,3 +1197,45 @@ mod csv_format {
         );
     }
 }
+
+// ----- streaming the operations out ------------------------------------------------
+
+#[test]
+fn each_operation_is_handed_over_in_the_order_diff_records_with_returns_them() {
+    let old: Vec<Value> = (0..40).map(|i| row(i, i)).collect();
+    let mut new: Vec<Value> = old.iter().filter(|r| r["id"] != 7).cloned().collect();
+    new[3] = row(3, 99);
+    new.insert(10, row(500, 1));
+    new.swap(20, 21);
+    let dir = Dir::new();
+    let (old_file, new_file) = (dir.rows("o.ndjson", &old), dir.rows("n.ndjson", &new));
+    let options = RecordOptions::new().key("id");
+    let collected = diff_records_with(&old_file, &new_file, &options).unwrap();
+    assert!(collected.len() > 3, "the case should have several operations");
+    let mut streamed = Vec::new();
+    diff_records_each(&old_file, &new_file, &options, |op| {
+        streamed.push(op);
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(streamed, collected);
+}
+
+#[test]
+fn an_error_from_the_callback_stops_the_diff_and_is_returned() {
+    let old: Vec<Value> = (0..50).map(|i| row(i, i)).collect();
+    let new: Vec<Value> = (0..50).map(|i| row(i, i + 1)).collect();
+    let dir = Dir::new();
+    let (old_file, new_file) = (dir.rows("o.ndjson", &old), dir.rows("n.ndjson", &new));
+    let mut calls = 0;
+    let result = diff_records_each(&old_file, &new_file, &RecordOptions::new().key("id"), |_| {
+        calls += 1;
+        if calls == 3 {
+            Err(DriftError::Io("the disk is full".into()))
+        } else {
+            Ok(())
+        }
+    });
+    assert!(matches!(&result, Err(DriftError::Io(m)) if m == "the disk is full"), "{result:?}");
+    assert_eq!(calls, 3, "no operation is handed over after the callback failed");
+}

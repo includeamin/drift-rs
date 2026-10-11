@@ -59,10 +59,12 @@ pub use model::{Delta, Operation};
 pub use patch::patch;
 pub use paths::list_json_paths;
 pub use pointer::{escape_token, join_pointer, split_pointer, unescape_token};
-pub use records::{diff_records, diff_records_with, Duplicates, RecordFormat, RecordOptions};
+pub use records::{
+    diff_records, diff_records_each, diff_records_with, Duplicates, RecordFormat, RecordOptions,
+};
 #[cfg(feature = "csv")]
 pub use records::{ColumnType, CsvOptions};
-pub use search::{filter_operations, path_matches};
+pub use search::{filter_operations, path_matches, OperationFilter};
 pub use stream_io::diff_files;
 
 /// The version of this crate, taken from `Cargo.toml` at build time.
