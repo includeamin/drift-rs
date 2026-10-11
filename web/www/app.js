@@ -1,10 +1,12 @@
-import init, { run_diff, detect_format, version } from "./pkg/drift_wasm.js";
+import init, * as wasm from "./pkg/drift_wasm.js";
+import { initModes } from "./modes.js";
 import { EXAMPLES } from "./examples.js";
 
 const $ = (id) => document.getElementById(id);
 const MAX_LINES_PER_VALUE = 400;
 const MAX_ROWS = 6000;
 
+const { run_diff, detect_format, version } = wasm;
 const state = { report: null, hints: { old: "", new: "" }, rawMode: "json", opFilter: new Set(), wasmBytes: 0 };
 
 // ---------- small helpers ----------
@@ -376,6 +378,7 @@ async function boot() {
     state.wasmBytes = bytes.byteLength;
     await init({ module_or_path: bytes });
     $("version").textContent = `v${version()}`;
+    initModes(wasm, state);
     $("loading").hidden = true;
     const wanted = new URLSearchParams(location.search).get("example");
     select.value = wanted !== null && EXAMPLES[Number(wanted)] ? wanted : "0";

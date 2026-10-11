@@ -39,7 +39,17 @@ No Rust toolchain required.
 An interactive demo runs drift as WebAssembly, entirely client-side. Paste or
 drop two JSON, YAML, TOML or XML documents to get a side-by-side visual diff,
 the RFC 6902 operations, and metrics (parse and diff time, sizes, operation
-counts, and a patch round-trip check).
+counts, and a patch round-trip check). Two more tabs cover the rest:
+
+- **Compare records**: paste two NDJSON, CSV or TSV files and match rows by a
+  key (composite keys, repeated-key policies, keyless mode and ignored fields
+  included). The result is the same as `drift diff --array-key` gives on files;
+  a test checks that on random input. Diffing files too big for memory
+  (`--memory-limit`) needs a disk, so it is command-line only.
+- **Apply, undo & squash**: apply an RFC 6902 patch to a document (YAML and TOML
+  keep their comments and layout), invert it to get the patch that undoes it, or
+  squash several patches into one. "Use last diff" carries the result of the
+  first tab over.
 
 Live at <https://includeamin.github.io/drift-rs/> once Pages is enabled
 (Settings → Pages → Source: *GitHub Actions*).
