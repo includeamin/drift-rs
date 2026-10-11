@@ -308,6 +308,50 @@ let operations = diff_files(Path::new("old.json"), Path::new("new.json"))?;
 - `--grep` is used, since it matches against values in the old document and so
   needs it fully loaded
 
+### Files of records (NDJSON)
+
+A file with one JSON object per line (`.ndjson` or `.jsonl`) can be compared
+without loading it, matching rows by a key field:
+
+```bash
+drift diff --array-key id old.ndjson new.ndjson
+```
+
+```rust
+use drift::{diff_records, DiffOptions};
+
+let operations = diff_records(old, new, "id", &DiffOptions::new())?;
+```
+
+Each file is read once into a small index (per row: its key, a 128-bit
+fingerprint of its contents and where it sits in the file). Rows are matched by
+key, rows with equal fingerprints are skipped without being parsed again, and only
+rows that changed are read back from disk. The result is exactly what the
+in-memory diff gives for the same rows as arrays matched by that key (the same
+planner produces both), so a row inserted at the front is one `add`, not a
+replacement of every row after it. `--ignore-path '/*/field'` works inside rows;
+the first `--array-key` is the row key and any others match arrays inside rows.
+
+Measured on two NDJSON files of 400,000 rows (48 MB each) with 8,000 rows changed,
+1,000 inserted in the middle and 1,000 deleted, on the same machine:
+
+| | Peak memory | Time |
+|---|---|---|
+| In memory, before this change | 1,283 MB | 198 s |
+| In memory, now | 1,283 MB | 6.9 s |
+| Streaming records | 100 MB | 3.7 s |
+
+All three produced byte-identical output. The in-memory speed-up has two causes:
+matched rows were looked up from the start of the list each time, which made a
+keyed diff quadratic in the number of rows (80,000 rows took 3.5 s), and equal
+values were walked field by field instead of being skipped.
+
+Limits: rows must be JSON objects, the key must be a string, number or boolean
+that is unique in each file, and NDJSON cannot come from stdin or be used with
+`--grep`. Memory is about 250 bytes a row across the two files, so a billion rows
+is still too many for one machine's RAM; the index could be spilled to disk if
+that is needed.
+
 ### Lower-level APIs
 
 `drift::streaming` exposes `StreamingArrayDiffer` and `StreamingObjectDiffer`
