@@ -260,11 +260,12 @@ impl RowReader {
             if self.eof {
                 break self.window.len() - from;
             }
-            let before = self.window.len();
-            self.window.resize(before + CHUNK, 0);
-            let read = self.file.read(&mut self.window[before..]).map_err(io)?;
-            self.window.truncate(before + read);
-            self.eof = read == 0;
+            // Read as much again as the row has taken so far, so a row of any length
+            // is looked through a few times, not once for every chunk of it.
+            let want = (self.window.len() - from).max(CHUNK);
+            let read =
+                (&mut self.file).take(want as u64).read_to_end(&mut self.window).map_err(io)?;
+            self.eof = read < want;
         };
         Ok(&self.window[from..from + length])
     }
@@ -507,4 +508,39 @@ pub(super) fn diff(
         }
     }
     Ok(Outcome::Done)
+}
+
+#[cfg(test)]
+mod reader_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn a_row_far_longer_than_a_chunk_is_looked_through_a_few_times_not_once_per_chunk() {
+        let dir = std::env::temp_dir().join(format!("drift-reader-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("long.ndjson");
+        let long = format!("{{\"id\":1,\"pad\":\"{}\"}}\n{{\"id\":2}}\n", "x".repeat(8 << 20));
+        std::fs::write(&path, &long).unwrap();
+
+        let mut reader = RowReader::open(&path).unwrap();
+        let calls = Cell::new(0);
+        let line = reader
+            .bytes(0, &|bytes| {
+                calls.set(calls.get() + 1);
+                bytes.iter().position(|&b| b == b'\n').map(|at| at + 1)
+            })
+            .unwrap();
+        let first_len = line.len();
+        assert_eq!(first_len, long.len() - "{\"id\":2}\n".len());
+        // 8 MiB in chunks of 64 KiB was 128 looks.
+        assert!(calls.get() <= 12, "{} looks", calls.get());
+
+        // The row after it comes straight from what was read.
+        let second = reader
+            .bytes(first_len as u64, &|b| b.iter().position(|&c| c == b'\n').map(|a| a + 1))
+            .unwrap();
+        assert_eq!(second, b"{\"id\":2}\n");
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

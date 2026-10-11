@@ -36,8 +36,13 @@ struct Run {
 impl Run {
     fn create(dir: &Path) -> io::Result<(Run, BufWriter<File>)> {
         static NEXT: AtomicUsize = AtomicUsize::new(0);
+        // The time as well as the process, so processes in different containers that
+        // share a directory (and so can share a process number) do not meet.
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.subsec_nanos());
         let path = dir.join(format!(
-            "drift-sort-{}-{}.run",
+            "drift-sort-{}-{stamp:08x}-{}.run",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
