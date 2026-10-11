@@ -371,6 +371,43 @@ enum Fault {
     /// The key part at this position is not a string, number or boolean.
     BadKey(usize),
     Json(serde_json::Error),
+    /// Reading or writing failed; the message already names the file.
+    Io(String),
+}
+
+/// 1-based line number of `offset` in a file, found by counting the lines before
+/// it. Only errors need it, so it is not kept for every row.
+fn line_of(path: &Path, offset: u64) -> u32 {
+    let Ok(file) = File::open(path) else { return 0 };
+    let mut reader = BufReader::with_capacity(1 << 20, file.take(offset));
+    let mut newlines = 0u32;
+    while let Ok(buffer) = reader.fill_buf() {
+        if buffer.is_empty() {
+            break;
+        }
+        newlines += buffer.iter().filter(|&&b| b == b'\n').count() as u32;
+        let consumed = buffer.len();
+        reader.consume(consumed);
+    }
+    newlines + 1
+}
+
+/// A problem with the row that starts at `offset`, named by file and line.
+fn error_at(path: &Path, offset: u64, message: impl fmt::Display) -> DriftError {
+    DriftError::Parse(format!("{}: line {}: {message}", path.display(), line_of(path, offset)))
+}
+
+/// The error for a row that could not be indexed.
+fn failure_error(path: &Path, spec: &KeySpec, failure: Failure) -> DriftError {
+    let label = |at: usize| spec.parts[at].label.as_str();
+    let message = match failure.fault {
+        Fault::NotObject => "a row must be a JSON object".to_string(),
+        Fault::NoKey(at) => format!("the row has no `{}` field", label(at)),
+        Fault::BadKey(at) => format!("`{}` must be a string, number or boolean", label(at)),
+        Fault::Json(error) => error.to_string(),
+        Fault::Io(message) => return DriftError::Io(message),
+    };
+    error_at(path, failure.offset, message)
 }
 
 /// What a file's rows look like, which is needed to read one back.
@@ -419,6 +456,13 @@ struct Part {
     offsets: Vec<u64>,
 }
 
+/// One row found while scanning a file.
+struct Scanned {
+    key: u128,
+    hash: u128,
+    offset: u64,
+}
+
 /// A row that could not be indexed: where its line starts, and what is wrong.
 struct Failure {
     offset: u64,
@@ -451,26 +495,11 @@ impl Rows {
     /// 1-based line number of `offset`, found by counting the lines before it.
     /// Only errors need it, so it is not kept for every row.
     fn line_of(&self, offset: u64) -> u32 {
-        let Ok(file) = File::open(&self.path) else { return 0 };
-        let mut reader = BufReader::with_capacity(1 << 20, file.take(offset));
-        let mut newlines = 0u32;
-        while let Ok(buffer) = reader.fill_buf() {
-            if buffer.is_empty() {
-                break;
-            }
-            newlines += buffer.iter().filter(|&&b| b == b'\n').count() as u32;
-            let consumed = buffer.len();
-            reader.consume(consumed);
-        }
-        newlines + 1
+        line_of(&self.path, offset)
     }
 
     fn error_at(&self, offset: u64, message: impl fmt::Display) -> DriftError {
-        DriftError::Parse(format!(
-            "{}: line {}: {message}",
-            self.path.display(),
-            self.line_of(offset)
-        ))
+        error_at(&self.path, offset, message)
     }
 
     fn index(path: &Path, spec: &KeySpec, format: &RecordFormat) -> Result<Rows> {
@@ -525,18 +554,7 @@ impl Rows {
                     rows.hashes.extend(part.hashes);
                     rows.offsets.extend(part.offsets);
                 }
-                Err(Failure { offset, fault }) => {
-                    let label = |at: usize| spec.parts[at].label.as_str();
-                    let message = match fault {
-                        Fault::NotObject => "a row must be a JSON object".to_string(),
-                        Fault::NoKey(at) => format!("the row has no `{}` field", label(at)),
-                        Fault::BadKey(at) => {
-                            format!("`{}` must be a string, number or boolean", label(at))
-                        }
-                        Fault::Json(error) => error.to_string(),
-                    };
-                    return Err(rows.error_at(offset, message));
-                }
+                Err(failure) => return Err(failure_error(path, spec, failure)),
             }
         }
         Ok(rows)

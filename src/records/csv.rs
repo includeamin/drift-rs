@@ -10,7 +10,9 @@
 //! break, so a line start is not always a row start and the file cannot be cut up
 //! at newlines.
 
-use super::{fingerprint, hash128, hash_key, open, KeySpec, Result, Rows, Source};
+use super::{
+    error_at, fingerprint, hash128, hash_key, open, KeySpec, Result, Rows, Scanned, Source,
+};
 use crate::DriftError;
 use serde_json::Value;
 use std::hash::Hash;
@@ -163,9 +165,6 @@ pub(super) fn parse_row(bytes: &[u8], layout: &Layout) -> std::result::Result<Va
 
 /// Indexes a CSV file: one entry per row, as for NDJSON.
 pub(super) fn index(path: &Path, spec: &KeySpec, options: &CsvOptions) -> Result<Rows> {
-    let file = open(path)?;
-    let end =
-        file.metadata().map_err(|e| DriftError::Io(format!("{}: {e}", path.display())))?.len();
     let mut rows = Rows {
         path: path.to_path_buf(),
         source: Source::Csv(Layout::empty(options.delimiter)),
@@ -173,30 +172,54 @@ pub(super) fn index(path: &Path, spec: &KeySpec, options: &CsvOptions) -> Result
         keys: Vec::new(),
         hashes: Vec::new(),
         offsets: Vec::new(),
-        end,
+        end: 0,
         view: None,
     };
+    let (layout, end) = scan(path, spec, options, &mut |row| {
+        rows.keys.push(row.key);
+        rows.hashes.push(row.hash);
+        rows.offsets.push(row.offset);
+        Ok(())
+    })?;
+    rows.source = Source::Csv(layout);
+    rows.end = end;
+    Ok(rows)
+}
+
+/// Reads a CSV file one row at a time, handing each to `sink` without keeping it.
+/// Returns the layout from the header, and the length of the file.
+pub(super) fn scan(
+    path: &Path,
+    spec: &KeySpec,
+    options: &CsvOptions,
+    sink: &mut dyn FnMut(Scanned) -> Result<()>,
+) -> Result<(Layout, u64)> {
+    let file = open(path)?;
+    let end =
+        file.metadata().map_err(|e| DriftError::Io(format!("{}: {e}", path.display())))?.len();
     let io = |e: &dyn std::fmt::Display| DriftError::Io(format!("{}: {e}", path.display()));
 
     let plain = Layout::empty(options.delimiter);
     let mut reader = plain.reader(BufReader::with_capacity(1 << 20, file));
     let mut record = csv::ByteRecord::new();
     if !reader.read_byte_record(&mut record).map_err(|e| io(&e))? {
-        return Ok(rows); // nothing at all, not even a header
+        return Ok((plain, end)); // nothing at all, not even a header
     }
 
     // The header: names that exist, are not empty and are not repeated.
     let mut names = Vec::with_capacity(record.len());
     for cell in &record {
         let name = std::str::from_utf8(cell)
-            .map_err(|_| rows.error_at(0, "a column name is not valid UTF-8"))?;
+            .map_err(|_| error_at(path, 0, "a column name is not valid UTF-8"))?;
         if name.is_empty() {
-            return Err(rows.error_at(0, "a column name is empty"));
+            return Err(error_at(path, 0, "a column name is empty"));
         }
         if names.iter().any(|n: &String| n == name) {
-            return Err(
-                rows.error_at(0, format!("the column `{name}` appears twice in the header"))
-            );
+            return Err(error_at(
+                path,
+                0,
+                format!("the column `{name}` appears twice in the header"),
+            ));
         }
         names.push(name.to_string());
     }
@@ -237,7 +260,7 @@ pub(super) fn index(path: &Path, spec: &KeySpec, options: &CsvOptions) -> Result
     let seed = layout.seed();
     while reader.read_byte_record(&mut record).map_err(|e| io(&e))? {
         let start = record.position().map_or(0, |p| p.byte());
-        let problem = |message: String| rows.error_at(start, message);
+        let problem = |message: String| error_at(path, start, message);
         let key = if spec.whole_row {
             fingerprint(&row_value(&record, &layout).map_err(problem)?)
         } else {
@@ -253,7 +276,8 @@ pub(super) fn index(path: &Path, spec: &KeySpec, options: &CsvOptions) -> Result
                 let value = cell_value(&record[at], layout.types[at], &layout.names[at])
                     .map_err(problem)?;
                 if !matches!(value, Value::String(_) | Value::Number(_) | Value::Bool(_)) {
-                    return Err(rows.error_at(
+                    return Err(error_at(
+                        path,
                         start,
                         format!("`{}` must be a string, number or boolean", part.label),
                     ));
@@ -269,10 +293,7 @@ pub(super) fn index(path: &Path, spec: &KeySpec, options: &CsvOptions) -> Result
                 cell.hash(hasher);
             }
         });
-        rows.keys.push(key);
-        rows.hashes.push(hash);
-        rows.offsets.push(start);
+        sink(Scanned { key, hash, offset: start })?;
     }
-    rows.source = Source::Csv(layout);
-    Ok(rows)
+    Ok((layout, end))
 }

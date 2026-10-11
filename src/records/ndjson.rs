@@ -1,7 +1,9 @@
 //! Reading NDJSON: one JSON value per line, cut up at line starts so a file can be
 //! indexed on several threads.
 
-use super::{fingerprint, hash_bytes, hash_key, open, trim, Failure, Fault, KeySpec, Part, Result};
+use super::{
+    fingerprint, hash_bytes, hash_key, open, trim, Failure, Fault, KeySpec, Part, Result, Scanned,
+};
 use crate::DriftError;
 use serde::de::{DeserializeSeed, Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde_json::Value;
@@ -158,20 +160,38 @@ pub(super) fn index_part(
     stop: u64,
     spec: &KeySpec,
 ) -> std::result::Result<Part, Failure> {
+    let mut part = Part { keys: Vec::new(), hashes: Vec::new(), offsets: Vec::new() };
+    scan_part(path, start, stop, spec, &mut |row| {
+        part.keys.push(row.key);
+        part.hashes.push(row.hash);
+        part.offsets.push(row.offset);
+        Ok(())
+    })?;
+    Ok(part)
+}
+
+/// Reads the lines that start in `start..stop` one at a time, handing each row to
+/// `sink` without keeping it.
+pub(super) fn scan_part(
+    path: &Path,
+    start: u64,
+    stop: u64,
+    spec: &KeySpec,
+    sink: &mut dyn FnMut(Scanned) -> std::result::Result<(), Failure>,
+) -> std::result::Result<(), Failure> {
     let io = |e: std::io::Error| Failure {
         offset: start,
-        fault: Fault::Json(serde::de::Error::custom(format!("{}: {e}", path.display()))),
+        fault: Fault::Io(format!("{}: {e}", path.display())),
     };
     let mut file = File::open(path).map_err(io)?;
     file.seek(SeekFrom::Start(start)).map_err(io)?;
     let mut reader = BufReader::with_capacity(1 << 20, file.take(stop - start));
-    let mut part = Part { keys: Vec::new(), hashes: Vec::new(), offsets: Vec::new() };
     let (mut buffer, mut offset) = (Vec::new(), start);
     loop {
         buffer.clear();
         let read = reader.read_until(b'\n', &mut buffer).map_err(io)?;
         if read == 0 {
-            return Ok(part);
+            return Ok(());
         }
         let line_start = offset;
         offset += read as u64;
@@ -189,8 +209,6 @@ pub(super) fn index_part(
                 read_key(text, spec).map_err(|fault| Failure { offset: line_start, fault })?;
             hash_key(&parts)
         };
-        part.keys.push(key);
-        part.hashes.push(hash_bytes(text));
-        part.offsets.push(line_start);
+        sink(Scanned { key, hash: hash_bytes(text), offset: line_start })?;
     }
 }
