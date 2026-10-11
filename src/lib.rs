@@ -49,6 +49,7 @@ mod pointer;
 mod records;
 mod scan;
 mod search;
+mod sorter;
 mod stream_io;
 pub mod streaming;
 
