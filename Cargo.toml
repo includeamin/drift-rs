@@ -28,18 +28,21 @@ required-features = ["cli"]
 [features]
 default = ["cli", "yaml", "toml", "xml"]
 # The `drift` binary. Needs every format, since it detects them by extension.
-cli = ["dep:clap", "yaml-comments", "toml", "xml"]
+cli = ["dep:clap", "yaml-comments", "toml", "xml", "csv"]
 # Optional document formats for `drift::formats`. JSON is always available.
 yaml = ["dep:serde_yaml"]
 # Keep comments and layout when patching YAML files (see `formats::dump_like`).
 yaml-comments = ["yaml", "dep:yaml-edit"]
 toml = ["dep:toml", "dep:toml_edit"]
 xml = ["dep:roxmltree"]
+# Comparing CSV and TSV files as records (see `diff_records_with`).
+csv = ["dep:csv"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"], optional = true }
 regex = "1"
 roxmltree = { version = "0.20", optional = true }
+csv = { version = "1", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 serde_yaml = { version = "0.9", optional = true }

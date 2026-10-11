@@ -28,7 +28,9 @@
 //! - `yaml`, `toml`, `xml`: support for those formats in [`formats`] (JSON is
 //!   always available). Using a format whose feature is off returns an error
 //!   saying which feature to enable.
-//! - `cli`: the `drift` binary; implies all three formats.
+//! - `yaml-comments`: keep comments when patching YAML files (implies `yaml`).
+//! - `csv`: compare CSV and TSV files as records, see [`diff_records_with`].
+//! - `cli`: the `drift` binary; implies all of the above.
 //!
 //! All are on by default. Library users who only need JSON can set
 //! `default-features = false`.
@@ -57,7 +59,9 @@ pub use model::{Delta, Operation};
 pub use patch::patch;
 pub use paths::list_json_paths;
 pub use pointer::{escape_token, join_pointer, split_pointer, unescape_token};
-pub use records::{diff_records, diff_records_with, Duplicates, RecordOptions};
+pub use records::{diff_records, diff_records_with, Duplicates, RecordFormat, RecordOptions};
+#[cfg(feature = "csv")]
+pub use records::{ColumnType, CsvOptions};
 pub use search::{filter_operations, path_matches};
 pub use stream_io::diff_files;
 
