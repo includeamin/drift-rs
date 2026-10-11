@@ -8,9 +8,6 @@
 //!
 //! Records are fixed-size, which keeps reading a run back to a plain `read_exact`.
 
-// Used by the bounded-memory diff, which comes in the next commit.
-#![cfg_attr(not(test), allow(dead_code))]
-
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::fs::{self, File, OpenOptions};
@@ -86,6 +83,11 @@ impl<T: Record> Sorter<T> {
     pub(crate) fn push(&mut self, record: T) -> io::Result<()> {
         if self.batch.len() == self.run_len {
             self.spill()?;
+        }
+        if self.batch.len() == self.batch.capacity() {
+            // Grow towards a full batch without the doubling that would overshoot it.
+            let room = self.run_len - self.batch.len();
+            self.batch.reserve_exact(self.batch.capacity().max(1024).min(room));
         }
         self.batch.push(record);
         Ok(())
