@@ -10,7 +10,7 @@ use serde_json::Value;
 use std::{
     fs,
     io::{self, Read},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 #[derive(Parser)]
@@ -257,16 +257,25 @@ struct OperationWriter {
     style: Style,
     count: usize,
     by_op: std::collections::BTreeMap<&'static str, u64>,
+    /// When writing to an existing or new regular file, the file the operations go
+    /// to meanwhile and the one it replaces when all is written. A diff that fails
+    /// leaves the destination as it was.
+    pending: Option<(PathBuf, PathBuf)>,
 }
 
 impl OperationWriter {
     /// Writes to a file, or to standard output for `-` or no destination.
     fn to(destination: &Option<String>, style: Style) -> io::Result<Self> {
+        let mut pending = None;
         let out: Box<dyn io::Write> = match destination {
-            Some(path) if path != "-" => Box::new(io::BufWriter::new(fs::File::create(path)?)),
+            Some(path) if path != "-" => {
+                let (file, replaces) = create_beside(Path::new(path))?;
+                pending = replaces;
+                Box::new(io::BufWriter::new(file))
+            }
             _ => Box::new(io::BufWriter::new(io::stdout())),
         };
-        Ok(Self { out, style, count: 0, by_op: Default::default() })
+        Ok(Self { out, style, count: 0, by_op: Default::default(), pending })
     }
 
     fn push(&mut self, operation: &Delta) -> io::Result<()> {
@@ -315,8 +324,48 @@ impl OperationWriter {
             Style::Json { compact: false } => writeln!(self.out, "\n]")?,
         }
         self.out.flush()?;
+        if let Some((temp, target)) = self.pending.take() {
+            // Close the file before it is renamed.
+            self.out = Box::new(io::sink());
+            fs::rename(&temp, &target).inspect_err(|_| {
+                let _ = fs::remove_file(&temp);
+            })?;
+        }
         Ok(self.count)
     }
+}
+
+impl Drop for OperationWriter {
+    /// A writer dropped before `finish` (the diff failed) removes its file.
+    fn drop(&mut self) {
+        if let Some((temp, _)) = self.pending.take() {
+            self.out = Box::new(io::sink());
+            let _ = fs::remove_file(temp);
+        }
+    }
+}
+
+/// A file to write the output to. For a regular file, or a path that does not exist
+/// yet, that is a new file in the same directory and the path to rename it to when
+/// the output is complete, so a failure does not destroy what was there. Anything
+/// else (a device such as /dev/null, a pipe) is written to directly.
+fn create_beside(path: &Path) -> io::Result<(fs::File, Option<(PathBuf, PathBuf)>)> {
+    let target = match fs::metadata(path) {
+        Ok(meta) if meta.is_file() => Some((fs::canonicalize(path)?, Some(meta.permissions()))),
+        Ok(_) => None,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Some((path.to_path_buf(), None)),
+        Err(e) => return Err(e),
+    };
+    let Some((target, permissions)) = target else {
+        return Ok((fs::File::create(path)?, None));
+    };
+    let name = target.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+    let temp = target.with_file_name(format!(".{name}.drift-{}.tmp", std::process::id()));
+    let file = fs::File::create(&temp)?;
+    if let Some(permissions) = permissions {
+        fs::set_permissions(&temp, permissions)?;
+    }
+    Ok((file, Some((temp, target))))
 }
 
 /// What to do about repeated row keys in NDJSON files.
@@ -1058,6 +1107,61 @@ mod tests {
             "sometimes"
         ])
         .is_err());
+    }
+
+    #[test]
+    fn a_diff_that_fails_leaves_the_output_file_as_it_was_and_one_that_works_replaces_it() {
+        let dir = Scratch::new("output-kept");
+        let good = dir.file("good.ndjson", "{\"id\":1,\"v\":1}\n{\"id\":2,\"v\":2}\n");
+        let changed = dir.file("changed.ndjson", "{\"id\":1,\"v\":9}\n{\"id\":2,\"v\":2}\n");
+        let repeated = dir.file("repeated.ndjson", "{\"id\":1}\n{\"id\":1}\n");
+        let out = dir.path("out.json");
+        std::fs::write(&out, "PREVIOUS").unwrap();
+
+        let failed = run_cli(&[
+            "drift",
+            "diff",
+            "--compact",
+            "-o",
+            &out,
+            &good,
+            &repeated,
+            "--array-key",
+            "id",
+        ]);
+        assert!(failed.is_err());
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "PREVIOUS");
+        // A failure after some output has been written, too.
+        let late = dir.file("late.ndjson", "{\"id\":1,\"v\":9}\n{\"id\":2,\"v\":3}\nnot json\n");
+        assert!(run_cli(&[
+            "drift",
+            "diff",
+            "--compact",
+            "-o",
+            &out,
+            &good,
+            &late,
+            "--array-key",
+            "id"
+        ])
+        .is_err());
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "PREVIOUS");
+
+        run_cli(&["drift", "diff", "--compact", "-o", &out, &good, &changed, "--array-key", "id"])
+            .unwrap();
+        assert!(std::fs::read_to_string(&out).unwrap().starts_with("[{\"op\":\"replace\""));
+        // A path that did not exist is created only by a diff that works.
+        let fresh = dir.path("fresh.json");
+        assert!(run_cli(&["drift", "diff", "-o", &fresh, &good, &repeated, "--array-key", "id"])
+            .is_err());
+        assert!(!std::path::Path::new(&fresh).exists());
+        // And nothing is left beside the output.
+        let mut names: Vec<_> = std::fs::read_dir(dir.path(""))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert!(names.iter().all(|n| !n.contains(".tmp")), "{names:?}");
     }
 
     #[test]

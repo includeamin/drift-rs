@@ -456,8 +456,14 @@ keys and `--keyless` included.
   limit (about 64 bytes a row) the diff is then done in memory; if not, it is an
   error before any output is written.
 - **It is slower** than the default for files that fit in memory, and needs disk
-  space for the sort: on the order of 100 bytes a row for each file, in `--temp-dir`.
+  space for the sort: about 55 bytes a row for each file at the peak (two files of 1 million rows took 106-121 MB), in `--temp-dir`.
   Temporary files are removed when the diff ends, fails or is stopped.
+- **Output is kept safe.** With `-o FILE` the operations go to a file beside it that
+  replaces `FILE` only when the diff has finished, so a diff that fails leaves
+  `FILE` as it was. (On standard output, what was written stays written.)
+- **When both files have problems**, the error reported may differ from the one
+  the default gives, because the sort scans both files before it joins them. With
+  one bad file the message is the same.
 
 Measured on generated NDJSON files of 1 and 4 million rows (137 MB and 554 MB
 each; about 1% of rows changed, 0.5% removed and 0.5% added), on a busy machine
