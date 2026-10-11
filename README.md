@@ -126,7 +126,8 @@ between that document and the patched one.
 |---------|---------|
 | `yaml`, `toml`, `xml` | Reading and writing that format in `drift::formats` (JSON is always available) |
 | `yaml-comments` | Keeping comments when patching YAML (implies `yaml`; needs `yaml-edit`) |
-| `cli` | The `drift` binary (implies the three formats and `yaml-comments`) |
+| `csv` | Comparing CSV and TSV files as records (needs the `csv` crate) |
+| `cli` | The `drift` binary (implies the three formats, `yaml-comments` and `csv`) |
 
 All are on by default. A library user who only needs JSON can drop the rest,
 which also drops `serde_yaml`, `toml`, `roxmltree` and `clap` from the build:
@@ -308,10 +309,11 @@ let operations = diff_files(Path::new("old.json"), Path::new("new.json"))?;
 - `--grep` is used, since it matches against values in the old document and so
   needs it fully loaded
 
-### Files of records (NDJSON)
+### Files of records (NDJSON, CSV, TSV)
 
-A file with one JSON object per line (`.ndjson` or `.jsonl`) can be compared
-without loading it, matching rows by a key:
+A file with one JSON object per line (`.ndjson` or `.jsonl`), or a CSV or TSV file
+with a header row (`.csv`, `.tsv`), can be compared without loading it, matching
+rows by a key:
 
 ```bash
 drift diff --array-key id old.ndjson new.ndjson
@@ -352,6 +354,48 @@ is the row key and any others match arrays inside rows.
   a removal plus an addition, never an edit, and identical rows are counted:
   `--duplicates occurrence` is the default there.
 
+#### CSV and TSV
+
+The first line is the header, and each later line is a row, read as an object of
+its cells keyed by the column names, so everything above works the same way:
+keys, composite keys, `--duplicates`, `--keyless` and `--ignore-path '/*/column'`.
+Row numbers do not count the header.
+
+```bash
+drift diff --array-key id old.csv new.csv
+drift diff --array-key id --types id:int,score:float,active:bool old.csv new.csv
+drift diff --array-key id --delimiter ';' old.csv new.csv     # .tsv uses tabs by default
+```
+
+```rust
+use drift::{ColumnType, CsvOptions, RecordFormat, RecordOptions};
+
+let csv = CsvOptions::new().delimiter(b';').column("id", ColumnType::Int);
+let options = RecordOptions::new().key("id").format(RecordFormat::Csv(csv));
+```
+
+- **Cells are strings** unless a column is given a type, so `007` stays `"007"` and
+  nothing is guessed from the data. Types are `string`, `int`, `float`, `bool` and
+  `json`; an empty cell of a typed column is `null`, and a cell that does not fit
+  its type is an error naming the file, line, column and cell.
+- **Quoted cells** may contain delimiters, quotes and line breaks. Lines in error
+  messages are physical lines, so a row after a two-line cell is reported where it
+  really is. A byte order mark and blank lines are ignored.
+- **Every row is checked** while the file is indexed, not only the ones that
+  change: a row with the wrong number of cells is an error, as are an empty or
+  repeated column name, a key column that is not in the header, and invalid UTF-8.
+- **The two files may have different columns**; a renamed column shows up as a
+  removal and an addition, even when the cells are identical.
+- **CSV is read on one thread**, because a quoted cell can contain a line break, so
+  a line start is not always a row start and the file cannot be cut at newlines.
+  Key parts are columns: a JSON Pointer into a row has nothing to reach into.
+
+On two CSV files of 400,000 rows (21 MB each, the same rows and changes as the
+NDJSON files below), the key takes 51 MB and about 1.3 s of single-threaded work,
+typed columns cost the same, and `--keyless` takes 61 MB and about 3 s. The
+operations are the same as for the NDJSON files, except that cells are strings
+unless typed.
+
 Measured on two NDJSON files of 400,000 rows (48 MB each) with 8,000 rows changed,
 1,000 inserted in the middle and 1,000 deleted, on the same machine:
 
@@ -371,8 +415,8 @@ the list each time, which made a keyed diff quadratic in the number of rows
 (80,000 rows took 3.5 s), and equal values were walked field by field instead of
 being skipped.
 
-Limits: rows must be JSON objects (except with `--keyless`), and NDJSON cannot
-come from stdin or be used with `--grep`. Memory is still proportional to the
+Limits: NDJSON rows must be JSON objects (except with `--keyless`), and record
+files cannot come from stdin or be used with `--grep`. Memory is still proportional to the
 number of rows, about 130 bytes a row across the two files, so a billion rows is
 too many for one machine's RAM; sorting or partitioning the index on disk would
 remove that, at the cost of a different output model for reordered rows. Rows with
