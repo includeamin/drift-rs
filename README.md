@@ -446,7 +446,7 @@ keys and `--keyless` included.
   limit (about 64 bytes a row) the diff is then done in memory; if not, it is an
   error before any output is written.
 - **It is slower** than the default for files that fit in memory, and needs disk
-  space for the sort: roughly 50 bytes a row for each file, in `--temp-dir`.
+  space for the sort: on the order of 100 bytes a row for each file, in `--temp-dir`.
   Temporary files are removed when the diff ends, fails or is stopped.
 
 Measured on generated NDJSON files of 1 and 4 million rows (137 MB and 554 MB
