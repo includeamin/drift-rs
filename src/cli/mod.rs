@@ -197,6 +197,36 @@ fn op_counts(operations: &[Delta]) -> Value {
     )
 }
 
+/// Files of records, one JSON object per line.
+fn is_records(path: &str) -> bool {
+    let extension = Path::new(path).extension().and_then(|e| e.to_str());
+    extension.is_some_and(|e| e.eq_ignore_ascii_case("ndjson") || e.eq_ignore_ascii_case("jsonl"))
+}
+
+/// Whether this diff compares two NDJSON files as records, and if so whether it
+/// can: they need a key and cannot come from stdin or be grepped.
+fn records_inputs(args: &DiffArgs) -> Result<bool, Box<dyn std::error::Error>> {
+    let (old, new) = (is_records(&args.old), is_records(&args.new));
+    if !old && !new {
+        return Ok(false);
+    }
+    if args.old == "-" || args.new == "-" {
+        return Err("NDJSON files are streamed from disk, so they cannot be read from stdin".into());
+    }
+    if !(old && new) {
+        return Err(
+            "to compare records, both inputs must be NDJSON files (.ndjson or .jsonl)".into()
+        );
+    }
+    if args.array_keys.is_empty() {
+        return Err("NDJSON files need --array-key FIELD, the field that identifies a row".into());
+    }
+    if !args.values.is_empty() {
+        return Err("--grep is not available for NDJSON files, which are not loaded whole".into());
+    }
+    Ok(true)
+}
+
 fn cmd_diff(args: DiffArgs) -> Result<i32, Box<dyn std::error::Error>> {
     // A pattern that is not a JSON Pointer would silently match nothing.
     for pattern in &args.ignore_paths {
@@ -205,6 +235,7 @@ fn cmd_diff(args: DiffArgs) -> Result<i32, Box<dyn std::error::Error>> {
         })?;
     }
     let format = resolve(args.format, &args.old);
+    let records = records_inputs(&args)?;
 
     // `--grep` inspects old values, so it needs the whole old document in memory.
     let delegate = matches!(format, drift::formats::Format::Json)
@@ -214,7 +245,14 @@ fn cmd_diff(args: DiffArgs) -> Result<i32, Box<dyn std::error::Error>> {
         && args.array_keys.is_empty()
         && args.ignore_paths.is_empty();
 
-    let (diff_operations, old) = if delegate {
+    let (diff_operations, old) = if records {
+        // One JSON object per line: matched by key and streamed, never loaded whole.
+        let key = &args.array_keys[0];
+        let options =
+            args.array_keys[1..].iter().fold(DiffOptions::new(), |o, key| o.array_key(key));
+        let options = args.ignore_paths.iter().fold(options, |o, pattern| o.ignore_path(pattern));
+        (drift::diff_records(Path::new(&args.old), Path::new(&args.new), key, &options)?, None)
+    } else if delegate {
         (diff_files(Path::new(&args.old), Path::new(&args.new))?, None)
     } else {
         let old = load(&args.old, format, args.xml_arrays)?.0;
@@ -457,6 +495,7 @@ mod tests {
 
     fn run_cli(args: &[&str]) -> Result<i32, Box<dyn std::error::Error>> {
         match Cli::try_parse_from(args)?.command {
+            Command::Diff(args) => cmd_diff(args),
             Command::Patch(args) => cmd_patch(args),
             Command::Invert(args) => cmd_invert(args),
             Command::Compose(args) => cmd_compose(args),
@@ -572,5 +611,91 @@ mod tests {
     fn compose_needs_a_document_and_at_least_one_patch() {
         assert!(Cli::try_parse_from(["drift", "compose", "doc.json"]).is_err());
         assert!(Cli::try_parse_from(["drift", "invert", "doc.json"]).is_err());
+    }
+
+    fn rows(range: std::ops::Range<u64>, edit: impl Fn(u64) -> u64) -> String {
+        range.map(|i| format!("{{\"id\":{i},\"v\":{},\"stamp\":{i}}}\n", edit(i))).collect()
+    }
+
+    #[test]
+    fn diffing_ndjson_files_streams_them_and_matches_rows_by_the_first_array_key() {
+        let dir = Scratch::new("ndjson");
+        let old = dir.file("old.ndjson", &rows(1..101, |i| i));
+        // A new first row, one changed row, and the last row dropped.
+        let new_text = format!(
+            "{{\"id\":0,\"v\":0,\"stamp\":0}}\n{}",
+            rows(1..100, |i| if i == 50 { 999 } else { i })
+        );
+        let new = dir.file("new.ndjson", &new_text);
+        let out = dir.path("ops.json");
+        assert_eq!(
+            run_cli(&["drift", "diff", &old, &new, "--array-key", "id", "--compact", "-o", &out])
+                .unwrap(),
+            0
+        );
+
+        let ops = read_ops(&out);
+        let paths: Vec<_> = ops.iter().map(|d| (d.op.as_str(), d.path.as_str())).collect();
+        // Remove, add and replace: and no run of replacements for the row inserted at the front.
+        assert_eq!(paths, [("remove", "/99"), ("add", "/0"), ("replace", "/50/v")]);
+    }
+
+    #[test]
+    fn ndjson_diffs_honour_ignore_path_and_the_other_filters() {
+        let dir = Scratch::new("ndjson-ignore");
+        let old = dir.file("old.jsonl", &rows(0..5, |i| i));
+        let new = dir.file(
+            "new.JSONL",
+            &(0..5)
+                .map(|i| format!("{{\"id\":{i},\"v\":{i},\"stamp\":{}}}\n", i + 100))
+                .collect::<String>(),
+        );
+        let out = dir.path("ops.json");
+        // Only the ignored field differs, so nothing is reported.
+        run_cli(&[
+            "drift",
+            "diff",
+            &old,
+            &new,
+            "--array-key",
+            "id",
+            "--ignore-path",
+            "/*/stamp",
+            "-o",
+            &out,
+        ])
+        .unwrap();
+        assert!(read_ops(&out).is_empty());
+        // Without ignoring it, every row differs and --op/--path still filter the result.
+        run_cli(&[
+            "drift",
+            "diff",
+            &old,
+            &new,
+            "--array-key",
+            "id",
+            "--compact",
+            "--path",
+            "/2/**",
+            "-o",
+            &out,
+        ])
+        .unwrap();
+        assert_eq!(read_ops(&out).len(), 1);
+    }
+
+    #[test]
+    fn ndjson_diffs_say_what_they_need() {
+        let dir = Scratch::new("ndjson-errors");
+        let old = dir.file("old.ndjson", &rows(0..3, |i| i));
+        let new = dir.file("new.ndjson", &rows(0..3, |i| i + 1));
+        let message = |args: &[&str]| run_cli(args).unwrap_err().to_string();
+        assert!(message(&["drift", "diff", &old, &new]).contains("--array-key"));
+        assert!(message(&["drift", "diff", &old, &new, "--array-key", "id", "--grep", "x"])
+            .contains("--grep"));
+        assert!(message(&["drift", "diff", "-", &new, "--array-key", "id"]).contains("stdin"));
+        // Mixing an NDJSON file with another format is a mistake worth a message.
+        let json = dir.file("doc.json", "[]");
+        assert!(message(&["drift", "diff", &old, &json, "--array-key", "id"]).contains("both"));
     }
 }

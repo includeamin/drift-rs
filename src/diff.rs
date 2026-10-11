@@ -91,13 +91,13 @@ impl DiffOptions {
 const POSITIONAL: DiffOptions = DiffOptions { array_keys: Vec::new(), ignore_paths: Vec::new() };
 
 /// The options plus the ignore patterns split into tokens once, not per node.
-struct Context<'a> {
+pub(crate) struct Context<'a> {
     options: &'a DiffOptions,
     ignore: Vec<Vec<&'a str>>,
 }
 
 impl<'a> Context<'a> {
-    fn new(options: &'a DiffOptions) -> Self {
+    pub(crate) fn new(options: &'a DiffOptions) -> Self {
         let ignore = options
             .ignore_paths
             .iter()
@@ -125,7 +125,7 @@ pub(crate) fn diff_inner(new: &Value, old: &Value, path: &str, output: &mut Vec<
 }
 
 /// Identity of an array item under `key`, distinguishing `1` from `"1"`.
-fn identity(item: &Value, key: &str) -> Option<String> {
+pub(crate) fn identity(item: &Value, key: &str) -> Option<String> {
     match item.get(key)? {
         value @ (Value::String(_) | Value::Number(_) | Value::Bool(_)) => Some(value.to_string()),
         _ => None,
@@ -157,12 +157,69 @@ pub fn match_array_items(
     })
 }
 
-/// Emits operations for an array whose items were matched by key.
+/// One step of the patch for an array whose items were matched by key, in the
+/// order it has to be applied.
+#[derive(Debug, PartialEq)]
+pub(crate) enum KeyedStep {
+    /// Delete the old item at this index.
+    Remove(usize),
+    /// Move the item at `from` to `to`.
+    Move { from: usize, to: usize },
+    /// New item `.0` is not in the old array: add it at index `.0`.
+    Add(usize),
+    /// New item `new` is old item `old`, now at its final index `new`: diff the pair.
+    Pair { old: usize, new: usize },
+}
+
+/// Works out the steps that turn an array of `old_len` items into the new one,
+/// given for each new item the old item it matches (`matches`, from
+/// [`match_array_items`]).
 ///
-/// Order matters because paths are indices into the array as it is at that
-/// point of the patch: first remove the unmatched old items (highest index
-/// first), then walk the new order, adding or moving each item into its final
-/// slot and diffing matched pairs once their index is final.
+/// Paths are indices into the array as it is at that point of the patch, so the
+/// order matters: first remove the unmatched old items (highest index first),
+/// then walk the new order, adding or moving each item into its final slot.
+/// Shared by the in-memory diff and the streaming one over records, so both
+/// produce the same operations.
+pub(crate) fn plan_keyed(
+    old_len: usize,
+    matches: &[Option<usize>],
+    mut step: impl FnMut(KeyedStep),
+) {
+    let mut kept = vec![false; old_len];
+    matches.iter().flatten().for_each(|&i| kept[i] = true);
+    for index in (0..old_len).rev().filter(|&i| !kept[i]) {
+        step(KeyedStep::Remove(index));
+    }
+
+    // Old index of the item currently at each position (`None` for added items).
+    let mut current: Vec<Option<usize>> = (0..old_len).filter(|&i| kept[i]).map(Some).collect();
+    for (index, matched) in matches.iter().enumerate() {
+        match *matched {
+            Some(old) => {
+                // Everything before `index` is already final and this item is not
+                // among it, so it is at `index` or later: usually exactly at `index`.
+                // Searching from the start made this quadratic.
+                let from = index
+                    + current[index..]
+                        .iter()
+                        .position(|&slot| slot == Some(old))
+                        .expect("matched item is present");
+                if from != index {
+                    step(KeyedStep::Move { from, to: index });
+                    let slot = current.remove(from);
+                    current.insert(index, slot);
+                }
+                step(KeyedStep::Pair { old, new: index });
+            }
+            None => {
+                step(KeyedStep::Add(index));
+                current.insert(index, None);
+            }
+        }
+    }
+}
+
+/// Emits operations for an array whose items were matched by key.
 fn keyed_array(
     new: &[Value],
     old: &[Value],
@@ -171,44 +228,30 @@ fn keyed_array(
     ctx: &Context,
     output: &mut Vec<Delta>,
 ) {
-    let mut kept = vec![false; old.len()];
-    matches.iter().flatten().for_each(|&i| kept[i] = true);
-    for index in (0..old.len()).rev().filter(|&i| !kept[i]) {
-        output.push(Delta::new(Operation::Remove, join_pointer(path, &index.to_string())));
-    }
-
-    // Old index of the item currently at each position (`None` for added items).
-    let mut current: Vec<Option<usize>> = (0..old.len()).filter(|&i| kept[i]).map(Some).collect();
-    for (index, item) in new.iter().enumerate() {
-        let target = join_pointer(path, &index.to_string());
-        match matches[index] {
-            Some(old_index) => {
-                let from = current
-                    .iter()
-                    .position(|&slot| slot == Some(old_index))
-                    .expect("matched item is present");
-                if from != index {
-                    output.push(Delta {
-                        op: Operation::Move,
-                        path: target.clone(),
-                        value: None,
-                        from_path: Some(join_pointer(path, &from.to_string())),
-                    });
-                    let slot = current.remove(from);
-                    current.insert(index, slot);
-                }
-                walk(item, &old[old_index], &target, ctx, output);
-            }
-            None => {
-                output.push(Delta::with_value(Operation::Add, target, item.clone()));
-                current.insert(index, None);
-            }
+    let at = |index: usize| join_pointer(path, &index.to_string());
+    plan_keyed(old.len(), matches, |step| match step {
+        KeyedStep::Remove(index) => output.push(Delta::new(Operation::Remove, at(index))),
+        KeyedStep::Move { from, to } => output.push(Delta {
+            op: Operation::Move,
+            path: at(to),
+            value: None,
+            from_path: Some(at(from)),
+        }),
+        KeyedStep::Add(index) => {
+            output.push(Delta::with_value(Operation::Add, at(index), new[index].clone()))
         }
-    }
+        KeyedStep::Pair { old: o, new: n } => walk(&new[n], &old[o], &at(n), ctx, output),
+    });
 }
 
-fn walk(new: &Value, old: &Value, path: &str, ctx: &Context, output: &mut Vec<Delta>) {
+pub(crate) fn walk(new: &Value, old: &Value, path: &str, ctx: &Context, output: &mut Vec<Delta>) {
     if ctx.ignored(path) {
+        return;
+    }
+    // Equal values produce no operations, however they are ignored or matched
+    // inside. Checking first saves building a path for every field of every
+    // unchanged row, which dominated the diff of a large array.
+    if new == old {
         return;
     }
     match (new, old) {
@@ -422,6 +465,22 @@ mod keyed_tests {
             let new = json!({"list": make(&mut next), "x": 1});
             roundtrips(&new, &old, &options);
         }
+    }
+
+    #[test]
+    fn a_large_keyed_array_that_is_mostly_in_order_diffs_in_linear_time() {
+        // The cheapest keyed diff there is: nothing moves, a few rows change. Looking
+        // each row up from the start of the list made this quadratic (80,000 rows took
+        // 3.5 s in a release build); it must be a few milliseconds.
+        let n = 60_000;
+        let old: Vec<Value> = (0..n).map(|i| json!({"id": i, "v": i % 97})).collect();
+        let new: Vec<Value> = (0..n)
+            .map(|i| json!({"id": i, "v": if i % 50 == 0 { 1000 } else { i % 97 }}))
+            .collect();
+        let started = std::time::Instant::now();
+        let ops = diff_with(&Value::Array(new), &Value::Array(old), &keyed(&["id"]));
+        assert_eq!(ops.len(), n / 50);
+        assert!(started.elapsed().as_secs_f64() < 5.0, "took {:?}", started.elapsed());
     }
 }
 
