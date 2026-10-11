@@ -71,6 +71,15 @@ struct DiffArgs {
     /// `/users/*/lastSeen`, `/**/id`. Loads both documents into memory.
     #[arg(long = "ignore-path")]
     ignore_paths: Vec<String>,
+    /// NDJSON files: match rows by their whole content, so no key is needed;
+    /// a changed row is then a removal and an addition. `--array-key` values
+    /// then apply to arrays inside rows.
+    #[arg(long)]
+    keyless: bool,
+    /// NDJSON files: what to do when several rows share a key. The default is
+    /// to refuse (`occurrence` for `--keyless`).
+    #[arg(long, value_enum)]
+    duplicates: Option<DuplicatesArg>,
     #[command(flatten)]
     output: OutputArgs,
 }
@@ -197,6 +206,30 @@ fn op_counts(operations: &[Delta]) -> Value {
     )
 }
 
+/// What to do about repeated row keys in NDJSON files.
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum DuplicatesArg {
+    /// Refuse, naming both lines
+    Error,
+    /// Keep the first row with a key and ignore the others
+    First,
+    /// Keep the last row with a key and ignore the others
+    Last,
+    /// Match the nth row with a key to the nth row with that key
+    Occurrence,
+}
+
+impl From<DuplicatesArg> for drift::Duplicates {
+    fn from(arg: DuplicatesArg) -> Self {
+        match arg {
+            DuplicatesArg::Error => Self::Error,
+            DuplicatesArg::First => Self::First,
+            DuplicatesArg::Last => Self::Last,
+            DuplicatesArg::Occurrence => Self::Occurrence,
+        }
+    }
+}
+
 /// Files of records, one JSON object per line.
 fn is_records(path: &str) -> bool {
     let extension = Path::new(path).extension().and_then(|e| e.to_str());
@@ -208,6 +241,11 @@ fn is_records(path: &str) -> bool {
 fn records_inputs(args: &DiffArgs) -> Result<bool, Box<dyn std::error::Error>> {
     let (old, new) = (is_records(&args.old), is_records(&args.new));
     if !old && !new {
+        if args.keyless || args.duplicates.is_some() {
+            return Err(
+                "--keyless and --duplicates apply only to NDJSON files (.ndjson or .jsonl)".into(),
+            );
+        }
         return Ok(false);
     }
     if args.old == "-" || args.new == "-" {
@@ -218,8 +256,11 @@ fn records_inputs(args: &DiffArgs) -> Result<bool, Box<dyn std::error::Error>> {
             "to compare records, both inputs must be NDJSON files (.ndjson or .jsonl)".into()
         );
     }
-    if args.array_keys.is_empty() {
-        return Err("NDJSON files need --array-key FIELD, the field that identifies a row".into());
+    if args.array_keys.is_empty() && !args.keyless {
+        return Err(
+            "NDJSON files need --array-key FIELD, the field that identifies a row, or --keyless"
+                .into(),
+        );
     }
     if !args.values.is_empty() {
         return Err("--grep is not available for NDJSON files, which are not loaded whole".into());
@@ -247,11 +288,25 @@ fn cmd_diff(args: DiffArgs) -> Result<i32, Box<dyn std::error::Error>> {
 
     let (diff_operations, old) = if records {
         // One JSON object per line: matched by key and streamed, never loaded whole.
-        let key = &args.array_keys[0];
-        let options =
-            args.array_keys[1..].iter().fold(DiffOptions::new(), |o, key| o.array_key(key));
-        let options = args.ignore_paths.iter().fold(options, |o, pattern| o.ignore_path(pattern));
-        (drift::diff_records(Path::new(&args.old), Path::new(&args.new), key, &options)?, None)
+        // The first --array-key names the row key (several fields, comma-separated,
+        // make a composite key); any others match arrays inside rows.
+        let (key_fields, inner_keys) = if args.keyless {
+            (Vec::new(), &args.array_keys[..])
+        } else {
+            let fields = args.array_keys[0].split(',').map(str::trim).filter(|f| !f.is_empty());
+            (fields.map(String::from).collect::<Vec<_>>(), &args.array_keys[1..])
+        };
+        let diff = inner_keys.iter().fold(DiffOptions::new(), |o, key| o.array_key(key));
+        let diff = args.ignore_paths.iter().fold(diff, |o, pattern| o.ignore_path(pattern));
+        let mut options = drift::RecordOptions::new().diff(diff);
+        options = key_fields.into_iter().fold(options, |o, field| o.key(field));
+        if args.keyless {
+            options = options.whole_row();
+        }
+        if let Some(policy) = args.duplicates {
+            options = options.duplicates(policy.into());
+        }
+        (drift::diff_records_with(Path::new(&args.old), Path::new(&args.new), &options)?, None)
     } else if delegate {
         (diff_files(Path::new(&args.old), Path::new(&args.new))?, None)
     } else {
@@ -697,5 +752,105 @@ mod tests {
         // Mixing an NDJSON file with another format is a mistake worth a message.
         let json = dir.file("doc.json", "[]");
         assert!(message(&["drift", "diff", &old, &json, "--array-key", "id"]).contains("both"));
+    }
+
+    fn ndjson_ops(args: &[&str], out: &str) -> Vec<(String, String)> {
+        let mut full = vec!["drift", "diff", "--compact", "-o", out];
+        full.extend_from_slice(args);
+        run_cli(&full).unwrap();
+        read_ops(out).into_iter().map(|d| (d.op.as_str().to_string(), d.path)).collect()
+    }
+
+    #[test]
+    fn a_comma_separated_array_key_is_a_composite_row_key() {
+        let dir = Scratch::new("ndjson-composite");
+        let old = dir.file(
+            "old.ndjson",
+            "{\"id\":1,\"region\":\"eu\",\"v\":1}\n{\"id\":1,\"region\":\"us\",\"v\":2}\n",
+        );
+        let new = dir.file(
+            "new.ndjson",
+            "{\"id\":1,\"region\":\"us\",\"v\":9}\n{\"id\":1,\"region\":\"eu\",\"v\":1}\n",
+        );
+        let out = dir.path("ops.json");
+        // Matched by (id, region): a move and a change, not a confusion of the two rows.
+        let ops = ndjson_ops(&[&old, &new, "--array-key", "id,region"], &out);
+        assert_eq!(ops, [("move".into(), "/0".into()), ("replace".into(), "/0/v".into())]);
+        // By id alone the key repeats, which is refused.
+        assert!(run_cli(&["drift", "diff", &old, &new, "--array-key", "id"])
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate"));
+    }
+
+    #[test]
+    fn the_row_key_can_be_a_json_pointer() {
+        let dir = Scratch::new("ndjson-pointer");
+        let old = dir
+            .file("old.ndjson", "{\"user\":{\"id\":1},\"v\":1}\n{\"user\":{\"id\":2},\"v\":2}\n");
+        let new = dir
+            .file("new.ndjson", "{\"user\":{\"id\":2},\"v\":2}\n{\"user\":{\"id\":1},\"v\":7}\n");
+        let ops = ndjson_ops(&[&old, &new, "--array-key", "/user/id"], &dir.path("ops.json"));
+        assert_eq!(ops, [("move".into(), "/0".into()), ("replace".into(), "/1/v".into())]);
+    }
+
+    #[test]
+    fn duplicates_can_be_resolved_instead_of_refused() {
+        let dir = Scratch::new("ndjson-dups");
+        let old = dir.file("old.ndjson", "{\"id\":1,\"v\":\"a\"}\n{\"id\":1,\"v\":\"b\"}\n");
+        let new = dir.file("new.ndjson", "{\"id\":1,\"v\":\"a\"}\n{\"id\":1,\"v\":\"c\"}\n");
+        let out = dir.path("ops.json");
+        assert!(run_cli(&["drift", "diff", &old, &new, "--array-key", "id"]).is_err());
+        // First keeps row 1 of each (no change); last keeps the second (b becomes c).
+        assert!(ndjson_ops(&[&old, &new, "--array-key", "id", "--duplicates", "first"], &out)
+            .is_empty());
+        assert_eq!(
+            ndjson_ops(&[&old, &new, "--array-key", "id", "--duplicates", "last"], &out),
+            [("replace".to_string(), "/0/v".to_string())]
+        );
+        // Occurrence pairs the nth row of a key with the nth: only the second changed.
+        assert_eq!(
+            ndjson_ops(&[&old, &new, "--array-key", "id", "--duplicates", "occurrence"], &out),
+            [("replace".to_string(), "/1/v".to_string())]
+        );
+        assert!(Cli::try_parse_from([
+            "drift",
+            "diff",
+            "a.ndjson",
+            "b.ndjson",
+            "--duplicates",
+            "sometimes"
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn keyless_matches_whole_rows_and_needs_no_array_key() {
+        let dir = Scratch::new("ndjson-keyless");
+        let old = dir.file("old.ndjson", "{\"a\":1}\n{\"a\":2}\n{\"a\":2}\n");
+        let new = dir.file("new.ndjson", "{\"a\":2}\n{\"a\":1}\n{\"a\":9}\n");
+        let ops = ndjson_ops(&[&old, &new, "--keyless"], &dir.path("ops.json"));
+        // One of the two identical rows {"a":2} is gone, {"a":9} is new, and the
+        // surviving rows were reordered: removals, a move and an addition, no edits.
+        assert!(ops.iter().all(|(op, _)| op != "replace"), "{ops:?}");
+        assert!(
+            ops.iter().any(|(op, _)| op == "remove") && ops.iter().any(|(op, _)| op == "add"),
+            "{ops:?}"
+        );
+        // The same file against itself has no differences.
+        assert!(ndjson_ops(&[&old, &old, "--keyless"], &dir.path("same.json")).is_empty());
+    }
+
+    #[test]
+    fn the_key_options_only_apply_to_ndjson_files() {
+        let dir = Scratch::new("ndjson-misuse");
+        let a = dir.file("a.json", "[]");
+        let b = dir.file("b.json", "[]");
+        for flag in [&["--keyless"][..], &["--duplicates", "first"][..]] {
+            let mut args = vec!["drift", "diff", &a, &b];
+            args.extend_from_slice(flag);
+            let message = run_cli(&args).unwrap_err().to_string();
+            assert!(message.contains("NDJSON"), "{flag:?}: {message}");
+        }
     }
 }
