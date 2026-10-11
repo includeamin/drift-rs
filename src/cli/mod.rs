@@ -204,15 +204,109 @@ fn write_output(
     Ok(())
 }
 
-/// Operations per type, with types in alphabetical order so the output is stable.
-fn op_counts(operations: &[Delta]) -> Value {
-    let mut counts = std::collections::BTreeMap::new();
-    for operation in operations {
-        *counts.entry(operation.op.as_str()).or_insert(0u64) += 1;
+/// The sign `--pretty` prints for an operation.
+fn sign(op: &Operation) -> &'static str {
+    match op {
+        Operation::Add => "+",
+        Operation::Remove => "-",
+        Operation::Replace => "~",
+        Operation::Move => "m",
+        Operation::Copy => "c",
+        Operation::Test => "?",
     }
-    Value::Object(
-        counts.into_iter().map(|(op, count)| (op.to_string(), Value::from(count))).collect(),
-    )
+}
+
+/// How `drift diff` prints its operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Style {
+    /// An RFC 6902 JSON array.
+    Json { compact: bool },
+    /// One `+ /path` line per operation (`--pretty`).
+    Summary,
+    /// Only the counts (`--stats`).
+    Stats { compact: bool },
+}
+
+impl Style {
+    fn of(args: &DiffArgs) -> Self {
+        let compact = args.output.compact;
+        if args.pretty {
+            Style::Summary
+        } else if args.stats {
+            Style::Stats { compact }
+        } else {
+            Style::Json { compact }
+        }
+    }
+}
+
+/// Writes operations as they arrive, so a large diff is never held whole. The
+/// bytes are those the collected output always had.
+struct OperationWriter {
+    out: Box<dyn io::Write>,
+    style: Style,
+    count: usize,
+    by_op: std::collections::BTreeMap<&'static str, u64>,
+}
+
+impl OperationWriter {
+    /// Writes to a file, or to standard output for `-` or no destination.
+    fn to(destination: &Option<String>, style: Style) -> io::Result<Self> {
+        let out: Box<dyn io::Write> = match destination {
+            Some(path) if path != "-" => Box::new(io::BufWriter::new(fs::File::create(path)?)),
+            _ => Box::new(io::BufWriter::new(io::stdout())),
+        };
+        Ok(Self { out, style, count: 0, by_op: Default::default() })
+    }
+
+    fn push(&mut self, operation: &Delta) -> io::Result<()> {
+        let first = self.count == 0;
+        match self.style {
+            Style::Summary => {
+                writeln!(self.out, "{} {}", sign(&operation.op), operation.path)?;
+            }
+            Style::Stats { .. } => {
+                *self.by_op.entry(operation.op.as_str()).or_insert(0) += 1;
+            }
+            Style::Json { compact: true } => {
+                write!(self.out, "{}", if first { "[" } else { "," })?;
+                serde_json::to_writer(&mut self.out, operation)?;
+            }
+            Style::Json { compact: false } => {
+                write!(self.out, "{}", if first { "[\n" } else { ",\n" })?;
+                // Each element indented to sit inside the array.
+                let element = serde_json::to_string_pretty(operation)?;
+                let indented: Vec<String> = element.lines().map(|l| format!("  {l}")).collect();
+                write!(self.out, "{}", indented.join("\n"))?;
+            }
+        }
+        self.count += 1;
+        Ok(())
+    }
+
+    /// Ends the output and returns how many operations were written.
+    fn finish(mut self) -> io::Result<usize> {
+        match self.style {
+            Style::Summary if self.count == 0 => writeln!(self.out)?,
+            Style::Summary => {}
+            Style::Stats { compact } => {
+                let by_op: serde_json::Map<String, Value> =
+                    self.by_op.iter().map(|(k, v)| (k.to_string(), Value::from(*v))).collect();
+                let payload = serde_json::json!({"total": self.count, "by_op": by_op});
+                let text = if compact {
+                    serde_json::to_string(&payload)?
+                } else {
+                    serde_json::to_string_pretty(&payload)?
+                };
+                writeln!(self.out, "{text}")?;
+            }
+            Style::Json { .. } if self.count == 0 => writeln!(self.out, "[]")?,
+            Style::Json { compact: true } => writeln!(self.out, "]")?,
+            Style::Json { compact: false } => writeln!(self.out, "\n]")?,
+        }
+        self.out.flush()?;
+        Ok(self.count)
+    }
 }
 
 /// What to do about repeated row keys in NDJSON files.
@@ -389,8 +483,10 @@ fn cmd_diff(args: DiffArgs) -> Result<i32, Box<dyn std::error::Error>> {
         && args.array_keys.is_empty()
         && args.ignore_paths.is_empty();
 
-    let (diff_operations, old) = if let Some(record_format) = records {
-        // One JSON object per line: matched by key and streamed, never loaded whole.
+    let style = Style::of(&args);
+    let kept = if let Some(record_format) = records {
+        // One JSON object per line: matched by key and streamed, never loaded whole,
+        // and the operations are written as they are found.
         // The first --array-key names the row key (several fields, comma-separated,
         // make a composite key); any others match arrays inside rows.
         let (key_fields, inner_keys) = if args.keyless {
@@ -409,63 +505,49 @@ fn cmd_diff(args: DiffArgs) -> Result<i32, Box<dyn std::error::Error>> {
         if let Some(policy) = args.duplicates {
             options = options.duplicates(policy.into());
         }
-        (drift::diff_records_with(Path::new(&args.old), Path::new(&args.new), &options)?, None)
-    } else if delegate {
-        (diff_files(Path::new(&args.old), Path::new(&args.new))?, None)
-    } else {
-        let old = load(&args.old, format, args.xml_arrays)?.0;
-        let new = load(&args.new, format, args.xml_arrays)?.0;
-        let options = args.array_keys.iter().fold(DiffOptions::new(), |o, key| o.array_key(key));
-        let options = args.ignore_paths.iter().fold(options, |o, pattern| o.ignore_path(pattern));
-        (diff_with(&new, &old, &options), Some(old))
-    };
-
-    let operations = filter_operations(
-        &diff_operations,
-        old.as_ref(),
-        &args.paths,
-        &args.fields,
-        &args.values,
-        &args.operations,
-        args.invert_match,
-    )?;
-    if args.pretty {
-        let text = operations
-            .iter()
-            .map(|operation| {
-                format!(
-                    "{} {}",
-                    match operation.op {
-                        Operation::Add => "+",
-                        Operation::Remove => "-",
-                        Operation::Replace => "~",
-                        Operation::Move => "m",
-                        Operation::Copy => "c",
-                        Operation::Test => "?",
-                    },
-                    operation.path
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        write_output(text, &args.output.output)?;
-    } else {
-        let payload = if args.stats {
-            let counts = op_counts(&operations);
-            serde_json::json!({"total": operations.len(), "by_op": counts})
-        } else {
-            serde_json::to_value(&operations)?
-        };
-        write_output(
-            if args.output.compact {
-                serde_json::to_string(&payload)?
-            } else {
-                serde_json::to_string_pretty(&payload)?
-            },
-            &args.output.output,
+        let filter = drift::OperationFilter::new(
+            &args.paths,
+            &args.fields,
+            &args.values,
+            &args.operations,
+            args.invert_match,
         )?;
-    }
-    Ok(if args.exit_code && !operations.is_empty() { 1 } else { 0 })
+        let mut writer = OperationWriter::to(&args.output.output, style)?;
+        drift::diff_records_each(Path::new(&args.old), Path::new(&args.new), &options, |op| {
+            if filter.keep(&op, None) {
+                writer.push(&op).map_err(|e| drift::DriftError::Io(e.to_string()))?;
+            }
+            Ok(())
+        })?;
+        writer.finish()?
+    } else {
+        let (diff_operations, old) = if delegate {
+            (diff_files(Path::new(&args.old), Path::new(&args.new))?, None)
+        } else {
+            let old = load(&args.old, format, args.xml_arrays)?.0;
+            let new = load(&args.new, format, args.xml_arrays)?.0;
+            let options =
+                args.array_keys.iter().fold(DiffOptions::new(), |o, key| o.array_key(key));
+            let options =
+                args.ignore_paths.iter().fold(options, |o, pattern| o.ignore_path(pattern));
+            (diff_with(&new, &old, &options), Some(old))
+        };
+        let operations = filter_operations(
+            &diff_operations,
+            old.as_ref(),
+            &args.paths,
+            &args.fields,
+            &args.values,
+            &args.operations,
+            args.invert_match,
+        )?;
+        let mut writer = OperationWriter::to(&args.output.output, style)?;
+        for operation in &operations {
+            writer.push(operation)?;
+        }
+        writer.finish()?
+    };
+    Ok(if args.exit_code && kept > 0 { 1 } else { 0 })
 }
 
 fn read_patch(path: &str) -> Result<Vec<Delta>, Box<dyn std::error::Error>> {
@@ -562,16 +644,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn op_counts_are_alphabetical_whatever_the_operation_order() {
-        let ops = [
+    fn stats_list_operation_types_alphabetically_whatever_the_order_they_arrive_in() {
+        let dir = Scratch::new("stats-order");
+        let path = dir.path("stats.json");
+        let mut writer =
+            OperationWriter::to(&Some(path.clone()), Style::Stats { compact: true }).unwrap();
+        for op in [
             Delta::new(Operation::Replace, "/a"),
             Delta::new(Operation::Remove, "/b"),
             Delta::new(Operation::Add, "/c"),
             Delta::new(Operation::Remove, "/d"),
-        ];
+        ] {
+            writer.push(&op).unwrap();
+        }
+        writer.finish().unwrap();
         assert_eq!(
-            serde_json::to_string(&op_counts(&ops)).unwrap(),
-            r#"{"add":1,"remove":2,"replace":1}"#
+            fs::read_to_string(&path).unwrap(),
+            "{\"total\":4,\"by_op\":{\"add\":1,\"remove\":2,\"replace\":1}}\n"
         );
     }
 
@@ -1062,5 +1151,98 @@ mod tests {
             ops.iter().any(|(op, _)| op == "add") && ops.iter().any(|(op, _)| op == "remove"),
             "{ops:?}"
         );
+    }
+
+    /// Operations of every shape the writer has to print.
+    fn sample_ops(count: usize) -> Vec<Delta> {
+        let all = vec![
+            Delta::with_value(
+                Operation::Add,
+                "/0",
+                serde_json::json!({"id": 1, "tags": ["a", "é"], "o": {"k": null}}),
+            ),
+            Delta::new(Operation::Remove, "/3"),
+            Delta::with_value(
+                Operation::Replace,
+                "/1/name",
+                serde_json::json!("Ada \"Lovelace\"\n"),
+            ),
+            Delta {
+                op: Operation::Move,
+                path: "/0".into(),
+                value: None,
+                from_path: Some("/4".into()),
+            },
+            Delta::with_value(Operation::Add, "/9", serde_json::json!([])),
+            Delta::with_value(Operation::Test, "/a~1b", serde_json::json!(1.5)),
+            Delta {
+                op: Operation::Copy,
+                path: "/x".into(),
+                value: None,
+                from_path: Some("/y".into()),
+            },
+        ];
+        all.into_iter().cycle().take(count).collect()
+    }
+
+    /// What `drift diff` printed before the output was written incrementally.
+    fn collected_output(ops: &[Delta], style: Style) -> String {
+        let text = match style {
+            Style::Summary => ops
+                .iter()
+                .map(|o| format!("{} {}", sign(&o.op), o.path))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            Style::Stats { compact } | Style::Json { compact } => {
+                let payload = if matches!(style, Style::Stats { .. }) {
+                    let mut counts = std::collections::BTreeMap::new();
+                    for o in ops {
+                        *counts.entry(o.op.as_str()).or_insert(0u64) += 1;
+                    }
+                    let counts: serde_json::Map<String, Value> =
+                        counts.into_iter().map(|(k, v)| (k.to_string(), Value::from(v))).collect();
+                    serde_json::json!({"total": ops.len(), "by_op": counts})
+                } else {
+                    serde_json::to_value(ops).unwrap()
+                };
+                if compact {
+                    serde_json::to_string(&payload).unwrap()
+                } else {
+                    serde_json::to_string_pretty(&payload).unwrap()
+                }
+            }
+        };
+        if text.ends_with('\n') {
+            text
+        } else {
+            format!("{text}\n")
+        }
+    }
+
+    #[test]
+    fn the_incremental_writer_prints_exactly_what_the_collected_output_did() {
+        let dir = Scratch::new("writer");
+        for style in [
+            Style::Json { compact: false },
+            Style::Json { compact: true },
+            Style::Summary,
+            Style::Stats { compact: false },
+            Style::Stats { compact: true },
+        ] {
+            for count in [0, 1, 2, 7, 15] {
+                let ops = sample_ops(count);
+                let path = dir.path("out.txt");
+                let mut writer = OperationWriter::to(&Some(path.clone()), style).unwrap();
+                for op in &ops {
+                    writer.push(op).unwrap();
+                }
+                assert_eq!(writer.finish().unwrap(), count);
+                assert_eq!(
+                    fs::read_to_string(&path).unwrap(),
+                    collected_output(&ops, style),
+                    "{style:?} with {count} operations"
+                );
+            }
+        }
     }
 }
