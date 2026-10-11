@@ -1,13 +1,17 @@
 import init, * as wasm from "./pkg/drift_wasm.js";
-import { initModes } from "./modes.js";
+import { initModes, RECORD_EXAMPLES } from "./modes.js";
 import { EXAMPLES } from "./examples.js";
 
 const $ = (id) => document.getElementById(id);
 const MAX_LINES_PER_VALUE = 400;
 const MAX_ROWS = 6000;
 
-const { run_diff, detect_format, version } = wasm;
-const state = { report: null, hints: { old: "", new: "" }, rawMode: "json", opFilter: new Set(), wasmBytes: 0 };
+const { run_diff, run_records, detect_format, version } = wasm;
+const state = {
+  mode: "diff", report: null, reports: { diff: null, records: null },
+  hints: { diff: { old: "", new: "" }, records: { old: "", new: "" } },
+  rawMode: "json", opFilter: new Set(), wasmBytes: 0,
+};
 
 // ---------- small helpers ----------
 const el = (tag, cls, text) => {
@@ -21,96 +25,164 @@ const fmtBytes = (n) => (n < 1024 ? `${n} B` : n < 1048576 ? `${(n / 1024).toFix
 const debounce = (fn, ms) => { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; };
 
 // ---------- inputs ----------
-function hintFor(side) {
-  return $(`fmt-${side}`).value || state.hints[side] || "";
+// Two kinds of input share the page and the results below it: documents, and files of
+// records. Their controls have the same ids, those of the records ones starting "r-".
+function detectRecords(text, hint) {
+  const h = (hint || "").toLowerCase();
+  if (["ndjson", "csv", "tsv"].includes(h)) return h;
+  if (/\.(ndjson|jsonl)$/.test(h)) return "ndjson";
+  if (/\.csv$/.test(h)) return "csv";
+  if (/\.tsv$/.test(h)) return "tsv";
+  const first = (text.split("\n").find((l) => l.trim()) ?? "").trim();
+  if (first.startsWith("{") || first.startsWith("[")) return "ndjson";
+  const count = (ch) => first.split(ch).length - 1;
+  return count("\t") > count(",") ? "tsv" : "csv";
 }
 
-function updateDetected(side) {
-  const text = $(`text-${side}`).value;
-  const label = $(`detected-${side}`);
-  if (!text.trim()) { label.textContent = ""; $(`foot-${side}`).textContent = ""; return; }
-  label.textContent = `detected: ${detect_format(text, hintFor(side))}`;
+const KINDS = {
+  diff: { p: "", detect: (text, hint) => detect_format(text, hint) },
+  records: { p: "r-", detect: detectRecords },
+};
+
+function hintFor(kind, side) {
+  return $(`${KINDS[kind].p}fmt-${side}`).value || state.hints[kind][side] || "";
+}
+
+function updateDetected(kind, side) {
+  const { p, detect } = KINDS[kind];
+  const text = $(`${p}text-${side}`).value;
+  const label = $(`${p}detected-${side}`);
+  if (!text.trim()) { label.textContent = ""; $(`${p}foot-${side}`).textContent = ""; return; }
+  label.textContent = `detected: ${detect(text, hintFor(kind, side))}`;
   const lines = text.split("\n").length;
-  $(`foot-${side}`).textContent = `${fmtBytes(new Blob([text]).size)} · ${lines} lines`;
+  $(`${p}foot-${side}`).textContent = `${fmtBytes(new Blob([text]).size)} · ${lines} lines`;
 }
 
-function setText(side, text, hint = "") {
-  $(`text-${side}`).value = text;
-  state.hints[side] = hint;
-  $(`fmt-${side}`).value = "";
-  updateDetected(side);
+function setText(kind, side, text, hint = "") {
+  const p = KINDS[kind].p;
+  $(`${p}text-${side}`).value = text;
+  state.hints[kind][side] = hint;
+  $(`${p}fmt-${side}`).value = "";
+  updateDetected(kind, side);
 }
 
-function readFile(side, file) {
+function readFile(kind, side, file) {
   const reader = new FileReader();
-  reader.onload = () => { setText(side, String(reader.result), file.name); compute(); };
+  reader.onload = () => { setText(kind, side, String(reader.result), file.name); compute(); };
   reader.readAsText(file);
 }
 
-for (const side of ["old", "new"]) {
-  $(`file-${side}`).addEventListener("change", (e) => e.target.files[0] && readFile(side, e.target.files[0]));
-  $(`text-${side}`).addEventListener("input", () => { state.hints[side] = ""; updateDetected(side); scheduleLive(); });
-  $(`fmt-${side}`).addEventListener("change", () => { updateDetected(side); compute(); });
-  const pane = $(`pane-${side}`);
-  pane.addEventListener("dragover", (e) => { e.preventDefault(); pane.classList.add("drag"); });
-  pane.addEventListener("dragleave", () => pane.classList.remove("drag"));
-  pane.addEventListener("drop", (e) => {
-    e.preventDefault();
-    pane.classList.remove("drag");
-    if (e.dataTransfer.files[0]) readFile(side, e.dataTransfer.files[0]);
+const scheduleLive = debounce(() => {
+  if ($(state.mode === "records" ? "r-live" : "live").checked) compute();
+}, 350);
+
+for (const kind of Object.keys(KINDS)) {
+  const p = KINDS[kind].p;
+  for (const side of ["old", "new"]) {
+    $(`${p}file-${side}`).addEventListener("change", (e) => e.target.files[0] && readFile(kind, side, e.target.files[0]));
+    $(`${p}text-${side}`).addEventListener("input", () => { state.hints[kind][side] = ""; updateDetected(kind, side); scheduleLive(); });
+    $(`${p}fmt-${side}`).addEventListener("change", () => { updateDetected(kind, side); compute(); });
+    const pane = $(`${p}pane-${side}`);
+    pane.addEventListener("dragover", (e) => { e.preventDefault(); pane.classList.add("drag"); });
+    pane.addEventListener("dragleave", () => pane.classList.remove("drag"));
+    pane.addEventListener("drop", (e) => {
+      e.preventDefault();
+      pane.classList.remove("drag");
+      if (e.dataTransfer.files[0]) readFile(kind, side, e.dataTransfer.files[0]);
+    });
+  }
+  $(`${p}run`).addEventListener("click", compute);
+  $(`${p}swap`).addEventListener("click", () => {
+    const [o, n, ho, hn] = [$(`${p}text-old`).value, $(`${p}text-new`).value, state.hints[kind].old, state.hints[kind].new];
+    setText(kind, "old", n, hn); setText(kind, "new", o, ho); compute();
+  });
+  $(`${p}clear`).addEventListener("click", () => {
+    setText(kind, "old", ""); setText(kind, "new", "");
+    state.reports[kind] = null; state.report = null;
+    $("results").hidden = true; $("error").hidden = true;
+    $(`${p}example`).value = "";
   });
 }
-
-$("array-keys").addEventListener("input", () => scheduleLive());
-$("ignore-paths").addEventListener("input", () => scheduleLive());
-
-const scheduleLive = debounce(() => { if ($("live").checked) compute(); }, 350);
+for (const id of ["array-keys", "ignore-paths", "r-key", "r-ignore"]) $(id).addEventListener("input", () => scheduleLive());
+for (const id of ["r-dups", "r-keyless"]) $(id).addEventListener("change", compute);
 
 const select = $("example");
 EXAMPLES.forEach((ex, i) => select.append(new Option(ex.name, String(i))));
 select.addEventListener("change", () => {
   const ex = EXAMPLES[Number(select.value)];
   if (!ex) return;
-  setText("old", ex.old.text, ex.old.hint);
-  setText("new", ex.new.text, ex.new.hint);
+  setText("diff", "old", ex.old.text, ex.old.hint);
+  setText("diff", "new", ex.new.text, ex.new.hint);
   $("array-keys").value = ex.keys ?? "";
   $("ignore-paths").value = ex.ignore ?? "";
   compute();
 });
 
-$("run").addEventListener("click", compute);
-$("swap").addEventListener("click", () => {
-  const [o, n, ho, hn] = [$("text-old").value, $("text-new").value, state.hints.old, state.hints.new];
-  setText("old", n, hn); setText("new", o, ho); compute();
+const recordSelect = $("r-example");
+RECORD_EXAMPLES.forEach((ex, i) => recordSelect.append(new Option(ex.name, String(i))));
+recordSelect.addEventListener("change", () => {
+  const ex = RECORD_EXAMPLES[Number(recordSelect.value)];
+  if (!ex) return;
+  setText("records", "old", ex.old, ex.hint);
+  setText("records", "new", ex.new, ex.hint);
+  $("r-key").value = ex.key; $("r-keyless").checked = !!ex.keyless;
+  $("r-dups").value = ex.dups ?? ""; $("r-ignore").value = ex.ignore ?? "";
+  compute();
 });
-$("clear").addEventListener("click", () => {
-  setText("old", ""); setText("new", "");
-  $("results").hidden = true; $("error").hidden = true; select.value = "";
+
+document.addEventListener("keydown", (e) => {
+  if ((e.ctrlKey || e.metaKey) && e.key === "Enter" && state.mode !== "patch") compute();
 });
-document.addEventListener("keydown", (e) => { if ((e.ctrlKey || e.metaKey) && e.key === "Enter") compute(); });
 
 // ---------- compute ----------
 function compute() {
-  const oldText = $("text-old").value, newText = $("text-new").value;
+  const kind = state.mode === "records" ? "records" : "diff";
+  const p = KINDS[kind].p;
+  const oldText = $(`${p}text-old`).value, newText = $(`${p}text-new`).value;
   if (!oldText.trim() && !newText.trim()) return;
   const started = performance.now();
   let result;
   try {
-    result = JSON.parse(run_diff(oldText, newText, hintFor("old"), hintFor("new"), $("array-keys").value, $("ignore-paths").value));
+    if (kind === "records") {
+      const old = KINDS.records.detect(oldText, hintFor(kind, "old")), neu = KINDS.records.detect(newText, hintFor(kind, "new"));
+      // A side with no text takes the other's format.
+      const formats = [oldText.trim() ? old : null, newText.trim() ? neu : null].filter(Boolean);
+      if (formats.length === 2 && formats[0] !== formats[1]) {
+        showError(`The two files are different formats (old: ${formats[0]}, new: ${formats[1]}). Choose the same format for both.`);
+        return;
+      }
+      result = JSON.parse(run_records(oldText, newText, formats[0], $("r-key").value, $("r-dups").value, $("r-keyless").checked, $("r-ignore").value));
+    } else {
+      result = JSON.parse(run_diff(oldText, newText, hintFor(kind, "old"), hintFor(kind, "new"), $("array-keys").value, $("ignore-paths").value));
+    }
   } catch (err) {
     showError(`Unexpected failure: ${err}`);
     return;
   }
   const roundTrip = performance.now() - started;
-  if (!result.ok) { showError(`Could not parse the ${result.side} document.\n${result.error}`); return; }
+  if (!result.ok) {
+    showError(kind === "records" ? result.error : `Could not parse the ${result.side} document.\n${result.error}`);
+    return;
+  }
   $("error").hidden = true;
 
   const renderStart = performance.now();
-  state.report = result;
+  state.report = state.reports[kind] = result;
   render();
   result.metrics.render_ms = performance.now() - renderStart;
   result.metrics.roundtrip_ms = roundTrip;
   renderMetrics(result.metrics);
+}
+
+// The results below belong to the mode that made them; switching modes shows that mode's.
+function onMode(name) {
+  state.mode = name;
+  const kind = name === "records" ? "records" : "diff";
+  $("shared").hidden = name === "patch";
+  $("error").hidden = true;
+  state.report = state.reports[kind];
+  if (state.report) { render(); renderMetrics(state.report.metrics); }
+  else $("results").hidden = true;
 }
 
 function showError(message) {
@@ -144,12 +216,16 @@ function renderMetrics(m) {
   }
   box.append(ops);
   box.append(metric("Input size", fmtBytes(m.old.bytes + m.new.bytes), `${fmtBytes(m.old.bytes)} old · ${fmtBytes(m.new.bytes)} new`));
+  if (m.rows) {
+    const { old: o, new: n, old_used: ou, new_used: nu } = m.rows;
+    box.append(metric("Rows", `${ou} → ${nu}`, ou === o && nu === n ? `${o} old · ${n} new` : `${o} old, ${n} new, repeats left out`));
+  }
   box.append(metric("Nodes", String(m.old.nodes + m.new.nodes), `${m.old.nodes} old · ${m.new.nodes} new`));
   box.append(metric("Depth", String(Math.max(m.old.depth, m.new.depth)), `${m.old.depth} old · ${m.new.depth} new`));
   const mbps = (m.old.bytes + m.new.bytes) / 1048576 / (m.diff_ms / 1000 || Infinity);
   box.append(metric("Throughput", Number.isFinite(mbps) ? [mbps.toFixed(1), "MB/s"] : "—", "diff step only"));
   box.append(metric("Formats", `${m.old.format} → ${m.new.format}`, m.old.format !== m.new.format ? "cross-format comparison" : "same format"));
-  const ignoring = $("ignore-paths").value.trim() ? " · ignored parts excluded" : "";
+  const ignoring = $(state.mode === "records" ? "r-ignore" : "ignore-paths").value.trim() ? " · ignored parts excluded" : "";
   box.append(metric("Patch check", m.roundtrip_ok ? "✓ verified" : "✗ failed", `apply in ${fmtMs(m.patch_ms)}${ignoring}`, m.roundtrip_ok ? "ok" : "bad"));
   box.append(metric("Render", fmtMs(m.render_ms), `round-trip to WASM ${fmtMs(m.roundtrip_ms)}`));
   box.append(metric("WASM module", fmtBytes(state.wasmBytes), `drift ${m.version}`));
@@ -378,11 +454,17 @@ async function boot() {
     state.wasmBytes = bytes.byteLength;
     await init({ module_or_path: bytes });
     $("version").textContent = `v${version()}`;
-    initModes(wasm, state);
+    initModes(wasm, state, onMode);
     $("loading").hidden = true;
     const wanted = new URLSearchParams(location.search).get("example");
     select.value = wanted !== null && EXAMPLES[Number(wanted)] ? wanted : "0";
-    select.dispatchEvent(new Event("change"));
+    // Start every tab with something to look at, and show the one in the address.
+    recordSelect.value = "0";
+    const current = state.mode;
+    state.mode = "records"; recordSelect.dispatchEvent(new Event("change"));
+    state.mode = "diff"; select.dispatchEvent(new Event("change"));
+    state.mode = current;
+    onMode(current);
   } catch (err) {
     $("loading").hidden = true;
     showError(`Failed to load WebAssembly: ${err}`);

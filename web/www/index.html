@@ -77,6 +77,120 @@
     </label>
   </div>
 
+</main>
+
+<main class="wrap" id="mode-records" hidden>
+  <section class="intro">
+    <p>Paste or drop two files of <strong>records</strong>: NDJSON, CSV or TSV. Rows are matched by a key, like <code>drift diff --array-key id</code>, so a row added at the front is one <code>add</code>, not a change to every row after it. The command line does this on files too big for memory.</p>
+    <label class="example">Try an example
+      <select id="r-example"><option value="">Choose…</option></select>
+    </label>
+  </section>
+
+  <section class="inputs" aria-label="Record inputs">
+    <div class="pane" id="r-pane-old">
+      <div class="pane-head">
+        <h2>Old</h2>
+        <span class="detected" id="r-detected-old"></span>
+        <select id="r-fmt-old" aria-label="Old format">
+          <option value="">Auto</option><option>ndjson</option><option>csv</option><option>tsv</option>
+        </select>
+        <label class="btn small">Upload<input type="file" id="r-file-old" hidden></label>
+      </div>
+      <textarea id="r-text-old" spellcheck="false" placeholder="Paste or drop the original file: one JSON object per line, or CSV/TSV with a header row…"></textarea>
+      <div class="pane-foot" id="r-foot-old"></div>
+    </div>
+    <div class="pane" id="r-pane-new">
+      <div class="pane-head">
+        <h2>New</h2>
+        <span class="detected" id="r-detected-new"></span>
+        <select id="r-fmt-new" aria-label="New format">
+          <option value="">Auto</option><option>ndjson</option><option>csv</option><option>tsv</option>
+        </select>
+        <label class="btn small">Upload<input type="file" id="r-file-new" hidden></label>
+      </div>
+      <textarea id="r-text-new" spellcheck="false" placeholder="Paste or drop the newer version of the file…"></textarea>
+      <div class="pane-foot" id="r-foot-new"></div>
+    </div>
+  </section>
+
+  <div class="actions">
+    <button class="btn primary" id="r-run">Compare rows <kbd>Ctrl</kbd>+<kbd>Enter</kbd></button>
+    <button class="btn" id="r-swap">Swap</button>
+    <button class="btn" id="r-clear">Clear</button>
+    <label class="check"><input type="checkbox" id="r-live" checked> Live</label>
+    <label class="check" title="The field that identifies a row. Several, comma-separated, make a composite key; a JSON Pointer such as /user/id reaches into a row">Key
+      <input type="text" id="r-key" class="keys" placeholder="e.g. id or id,region" spellcheck="false" autocomplete="off">
+    </label>
+    <label class="check" title="What to do when several rows share a key">Repeated keys
+      <select id="r-dups"><option value="">Refuse</option><option value="first">Keep the first</option><option value="last">Keep the last</option><option value="occurrence">Match nth to nth</option></select>
+    </label>
+    <label class="check" title="Match rows by their whole content; a changed row is a removal and an addition. Repeated rows are matched nth to nth."><input type="checkbox" id="r-keyless"> Keyless</label>
+    <label class="check" title="Leave these parts of each row out, written as /*/field">Ignore
+      <input type="text" id="r-ignore" class="keys wide" placeholder="e.g. /*/updatedAt" spellcheck="false" autocomplete="off">
+    </label>
+  </div>
+</main>
+
+<main class="wrap" id="mode-patch" hidden>
+  <section class="intro">
+    <p>Take a patch further: <strong>apply</strong> it to a document (YAML and TOML keep their comments and layout), <strong>undo</strong> it by inverting it, or <strong>squash</strong> several patches into one.</p>
+    <label class="example">Try an example
+      <select id="pt-example"><option value="">Choose…</option></select>
+    </label>
+  </section>
+  <section class="inputs" aria-label="Patch inputs">
+    <div class="pane" id="pt-pane-doc">
+      <div class="pane-head">
+        <h2>Document</h2>
+        <span class="detected" id="pt-detected"></span>
+        <select id="pt-format" aria-label="Document format">
+          <option value="">Auto</option><option>json</option><option>yaml</option><option>toml</option><option>xml</option>
+        </select>
+        <label class="btn small">Upload<input type="file" id="pt-file-doc" hidden></label>
+      </div>
+      <textarea id="pt-doc" spellcheck="false" placeholder="Paste or drop the document the patch applies to…"></textarea>
+      <div class="pane-foot" id="pt-foot-doc"></div>
+    </div>
+    <div class="pane" id="pt-pane-patch">
+      <div class="pane-head">
+        <h2>Patch</h2>
+        <span class="detected">RFC 6902 JSON</span>
+        <button class="btn small" id="pt-from-diff" title="Fill in the document and patch from the last result of Compare documents">Use last diff</button>
+        <label class="btn small">Upload<input type="file" id="pt-file-patch" hidden></label>
+      </div>
+      <textarea id="pt-patch" spellcheck="false" placeholder='Paste or drop a patch: [{"op":"replace","path":"/a","value":2}]. To squash, an array of patches: [[…],[…]]'></textarea>
+      <div class="pane-foot" id="pt-foot-patch"></div>
+    </div>
+  </section>
+
+  <div class="actions">
+    <button class="btn primary" id="pt-apply">Apply</button>
+    <button class="btn" id="pt-invert" title="The patch that undoes this one on this document">Undo (invert)</button>
+    <button class="btn" id="pt-compose" title="Several patches in turn become one with the same effect">Squash</button>
+    <button class="btn" id="pt-clear">Clear</button>
+    <label class="check" title="Run the last action again as you type"><input type="checkbox" id="pt-live" checked> Live</label>
+    <label class="check" title="Squash: match array items by these fields">Array key
+      <input type="text" id="pt-keys" class="keys" placeholder="e.g. id" spellcheck="false" autocomplete="off">
+    </label>
+    <label class="check" title="Squash: leave these parts out">Ignore
+      <input type="text" id="pt-ignore" class="keys wide" placeholder="e.g. /updatedAt" spellcheck="false" autocomplete="off">
+    </label>
+  </div>
+  <div id="pt-error" class="error" role="alert" hidden></div>
+  <section id="pt-results" hidden>
+    <div class="toolbar">
+      <strong id="pt-title"></strong>
+      <span class="muted" id="pt-note"></span>
+      <div class="grow"></div>
+      <button class="btn small" id="pt-copy">Copy</button>
+      <button class="btn small" id="pt-download">Download</button>
+    </div>
+    <pre class="raw" id="pt-out"></pre>
+  </section>
+</main>
+
+<main class="wrap" id="shared">
   <div id="error" class="error" role="alert" hidden></div>
   <div id="loading" class="muted">Loading WebAssembly…</div>
 
@@ -122,101 +236,6 @@
       </div>
       <pre class="raw" id="raw"></pre>
     </div>
-  </section>
-</main>
-
-<main class="wrap" id="mode-records" hidden>
-  <section class="intro">
-    <p>Compare two files of <strong>records</strong> (NDJSON, CSV or TSV), matching rows by a key like <code>drift diff --array-key id</code> does. A row added at the front is one <code>add</code>, not a change to every row after it. The command line does this on files too big for memory.</p>
-    <label class="example">Try an example
-      <select id="rec-example"><option value="">Choose…</option></select>
-    </label>
-  </section>
-  <section class="inputs" aria-label="Record inputs">
-    <div class="pane">
-      <div class="pane-head"><h2>Old</h2><span class="detected" id="rec-foot-old"></span></div>
-      <textarea id="rec-old" spellcheck="false" placeholder="One JSON object per line, or CSV/TSV with a header row…"></textarea>
-      <div class="pane-foot"></div>
-    </div>
-    <div class="pane">
-      <div class="pane-head"><h2>New</h2><span class="detected" id="rec-foot-new"></span></div>
-      <textarea id="rec-new" spellcheck="false" placeholder="The newer version of the same file…"></textarea>
-      <div class="pane-foot"></div>
-    </div>
-  </section>
-  <div class="actions">
-    <button class="btn primary" id="rec-run">Compare rows</button>
-    <label class="check">Format
-      <select id="rec-format"><option value="ndjson">NDJSON</option><option value="csv">CSV</option><option value="tsv">TSV</option></select>
-    </label>
-    <label class="check" title="The field that identifies a row. Several, comma-separated, make a composite key; a JSON Pointer such as /user/id reaches into a row">Key
-      <input type="text" id="rec-key" class="keys" placeholder="e.g. id or id,region" spellcheck="false" autocomplete="off">
-    </label>
-    <label class="check" title="What to do when several rows share a key">Repeated keys
-      <select id="rec-dups"><option value="">Refuse (keyless: match nth to nth)</option><option value="first">Keep the first</option><option value="last">Keep the last</option><option value="occurrence">Match nth to nth</option></select>
-    </label>
-    <label class="check" title="Match rows by their whole content; a changed row is a removal and an addition"><input type="checkbox" id="rec-keyless"> Keyless</label>
-    <label class="check" title="Leave these parts of each row out, written as /*/field">Ignore
-      <input type="text" id="rec-ignore" class="keys wide" placeholder="e.g. /*/updatedAt" spellcheck="false" autocomplete="off">
-    </label>
-  </div>
-  <div id="rec-error" class="error" role="alert" hidden></div>
-  <section id="rec-results" hidden>
-    <div class="metrics" id="rec-metrics"></div>
-    <div class="toolbar">
-      <div class="filters" id="rec-filters"></div>
-      <div class="grow"></div>
-      <button class="btn small" id="rec-copy">Copy</button>
-    </div>
-    <div class="table-wrap"><table class="ops"><thead><tr><th>Op</th><th>Path</th><th>Value</th></tr></thead><tbody id="rec-body"></tbody></table></div>
-  </section>
-</main>
-
-<main class="wrap" id="mode-patch" hidden>
-  <section class="intro">
-    <p>Take a patch further: <strong>apply</strong> it to a document (YAML and TOML keep their comments and layout), <strong>undo</strong> it by inverting it, or <strong>squash</strong> several patches into one.</p>
-    <label class="example">Try an example
-      <select id="pt-example"><option value="">Choose…</option></select>
-    </label>
-  </section>
-  <section class="inputs" aria-label="Patch inputs">
-    <div class="pane">
-      <div class="pane-head">
-        <h2>Document</h2><span class="detected" id="pt-detected"></span>
-        <select id="pt-format" aria-label="Document format"><option value="">Auto</option><option>json</option><option>yaml</option><option>toml</option><option>xml</option></select>
-      </div>
-      <textarea id="pt-doc" spellcheck="false" placeholder="The document the patch applies to…"></textarea>
-      <div class="pane-foot"></div>
-    </div>
-    <div class="pane">
-      <div class="pane-head">
-        <h2>Patch</h2><span class="detected">RFC 6902 JSON</span>
-        <button class="btn small" id="pt-from-diff" title="Fill in the document and patch from the last Compare documents result">Use last diff</button>
-      </div>
-      <textarea id="pt-patch" spellcheck="false" placeholder='[{"op":"replace","path":"/a","value":2}] — or, to squash, an array of patches: [[…],[…]]'></textarea>
-      <div class="pane-foot"></div>
-    </div>
-  </section>
-  <div class="actions">
-    <button class="btn primary" id="pt-apply">Apply</button>
-    <button class="btn" id="pt-invert" title="The patch that undoes this one on this document">Undo (invert)</button>
-    <button class="btn" id="pt-compose" title="Several patches in turn become one with the same effect">Squash</button>
-    <label class="check" title="Squash: match array items by these fields">Array key
-      <input type="text" id="pt-keys" class="keys" placeholder="e.g. id" spellcheck="false" autocomplete="off">
-    </label>
-    <label class="check" title="Squash: leave these parts out">Ignore
-      <input type="text" id="pt-ignore" class="keys wide" placeholder="e.g. /updatedAt" spellcheck="false" autocomplete="off">
-    </label>
-  </div>
-  <div id="pt-error" class="error" role="alert" hidden></div>
-  <section id="pt-results" hidden>
-    <div class="toolbar">
-      <strong id="pt-title"></strong>
-      <span class="muted" id="pt-note"></span>
-      <div class="grow"></div>
-      <button class="btn small" id="pt-copy">Copy</button>
-    </div>
-    <pre class="raw" id="pt-out"></pre>
   </section>
 </main>
 
