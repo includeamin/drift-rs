@@ -134,17 +134,23 @@ connections = 100
 export function initModes(wasm, diffState, onMode) {
   // ---- switcher ----
   const modes = ["diff", "records", "patch"];
-  function showMode(name) {
+  // `record` adds a history entry, so Back and Forward move between tabs.
+  function showMode(name, record = false) {
     for (const m of modes) $(`mode-${m}`).hidden = m !== name;
     for (const b of document.querySelectorAll(".mode")) {
       const on = b.dataset.mode === name;
       b.classList.toggle("active", on);
       b.setAttribute("aria-selected", String(on));
     }
-    try { history.replaceState(null, "", name === "diff" ? location.pathname : `#${name}`); } catch { /* not allowed in some contexts */ }
+    try {
+      const url = name === "diff" ? location.pathname + location.search : `${location.pathname}${location.search}#${name}`;
+      if (record) history.pushState(null, "", url); else history.replaceState(null, "", url);
+    } catch { /* not allowed in some contexts */ }
     onMode(name);
   }
-  document.querySelectorAll(".mode").forEach((b) => b.addEventListener("click", () => showMode(b.dataset.mode)));
+  document.querySelectorAll(".mode").forEach((b) => b.addEventListener("click", () => showMode(b.dataset.mode, true)));
+  const fromAddress = () => (modes.includes(location.hash.slice(1)) ? location.hash.slice(1) : "diff");
+  window.addEventListener("popstate", () => showMode(fromAddress()));
 
   const copyButton = (button, getText) => button.addEventListener("click", async () => {
     try { await navigator.clipboard.writeText(getText()); button.textContent = "Copied"; }
@@ -173,6 +179,7 @@ export function initModes(wasm, diffState, onMode) {
 
   function ptRun(kind) {
     pt.last = kind;
+    $("pt-live-note").hidden = true;
     const doc = $("pt-doc").value, patch = $("pt-patch").value, hint = $("pt-format").value || pt.hint;
     if (!doc.trim() && !patch.trim()) return;
     if (!doc.trim() || !patch.trim()) { ptError("Paste a document and a patch first."); return; }
@@ -220,7 +227,19 @@ export function initModes(wasm, diffState, onMode) {
   });
 
   // Typing, dropping or uploading runs the last action again, as in the other tabs.
-  const live = debounce(() => { ptFooters(); if ($("pt-live").checked) ptRun(pt.last); }, 350);
+  const LIVE_LIMIT = 1_000_000; // see app.js: the work is done on the page's own thread
+  const live = debounce(() => {
+    ptFooters();
+    if (!$("pt-live").checked) return;
+    const size = $("pt-doc").value.length + $("pt-patch").value.length;
+    const note = $("pt-live-note");
+    note.hidden = size <= LIVE_LIMIT;
+    if (size > LIVE_LIMIT) {
+      note.textContent = `${fmtBytes(size)} of input: not running as you type. Press Apply, Undo or Squash, or Ctrl+Enter.`;
+      return;
+    }
+    ptRun(pt.last);
+  }, 350);
   const load = (id, file, isDoc) => {
     const reader = new FileReader();
     reader.onload = () => {
@@ -272,7 +291,6 @@ export function initModes(wasm, diffState, onMode) {
     ptFooters(); ptRun("apply");
   });
 
-  const wanted = location.hash.slice(1);
-  showMode(modes.includes(wanted) ? wanted : "diff");
+  showMode(fromAddress());
   return { showMode };
 }

@@ -72,8 +72,22 @@ function readFile(kind, side, file) {
   reader.readAsText(file);
 }
 
+// Computing runs on the page's own thread, so big inputs are not recomputed on every
+// keystroke: past this many characters the result waits for Compare or Ctrl+Enter.
+const LIVE_LIMIT = 1_000_000;
+
 const scheduleLive = debounce(() => {
-  if ($(state.mode === "records" ? "r-live" : "live").checked) compute();
+  const records = state.mode === "records";
+  if (!$(records ? "r-live" : "live").checked) return;
+  const p = records ? "r-" : "";
+  const size = $(`${p}text-old`).value.length + $(`${p}text-new`).value.length;
+  const note = $("live-note");
+  note.hidden = size <= LIVE_LIMIT;
+  if (size > LIVE_LIMIT) {
+    note.textContent = `${fmtBytes(size)} of input: not recomputing as you type. Press Compare, or Ctrl+Enter, to run.`;
+    return;
+  }
+  compute();
 }, 350);
 
 for (const kind of Object.keys(KINDS)) {
@@ -136,6 +150,7 @@ document.addEventListener("keydown", (e) => {
 
 // ---------- compute ----------
 function compute() {
+  $("live-note").hidden = true;
   const kind = state.mode === "records" ? "records" : "diff";
   const p = KINDS[kind].p;
   const oldText = $(`${p}text-old`).value, newText = $(`${p}text-new`).value;
@@ -179,6 +194,7 @@ function onMode(name) {
   state.mode = name;
   const kind = name === "records" ? "records" : "diff";
   $("shared").hidden = name === "patch";
+  $("live-note").hidden = true;
   $("error").hidden = true;
   state.report = state.reports[kind];
   if (state.report) { render(); renderMetrics(state.report.metrics); }

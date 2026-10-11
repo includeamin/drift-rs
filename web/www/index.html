@@ -24,12 +24,12 @@
 </header>
 
 <div class="modes wrap" role="tablist" aria-label="Mode">
-  <button role="tab" class="mode active" data-mode="diff" aria-selected="true">Compare documents</button>
-  <button role="tab" class="mode" data-mode="records" aria-selected="false">Compare records</button>
-  <button role="tab" class="mode" data-mode="patch" aria-selected="false">Apply, undo &amp; squash</button>
+  <button role="tab" class="mode active" id="mode-tab-diff" aria-controls="mode-diff" data-mode="diff" aria-selected="true">Compare documents</button>
+  <button role="tab" class="mode" id="mode-tab-records" aria-controls="mode-records" data-mode="records" aria-selected="false">Compare records</button>
+  <button role="tab" class="mode" id="mode-tab-patch" aria-controls="mode-patch" data-mode="patch" aria-selected="false">Apply, undo &amp; squash</button>
 </div>
 
-<main class="wrap" id="mode-diff">
+<main class="wrap" id="mode-diff" role="tabpanel" aria-labelledby="mode-tab-diff">
   <section class="intro">
     <p>Paste or drop two documents. <strong>JSON, YAML, TOML and XML</strong> are supported, and you can even compare across formats. Nothing leaves your browser.</p>
     <label class="example">Try an example
@@ -79,7 +79,7 @@
 
 </main>
 
-<main class="wrap" id="mode-records" hidden>
+<main class="wrap" id="mode-records" role="tabpanel" aria-labelledby="mode-tab-records" hidden>
   <section class="intro">
     <p>Paste or drop two files of <strong>records</strong>: NDJSON, CSV or TSV. Rows are matched by a key, like <code>drift diff --array-key id</code>, so a row added at the front is one <code>add</code>, not a change to every row after it. The command line does this on files too big for memory.</p>
     <label class="example">Try an example
@@ -132,7 +132,7 @@
   </div>
 </main>
 
-<main class="wrap" id="mode-patch" hidden>
+<main class="wrap" id="mode-patch" role="tabpanel" aria-labelledby="mode-tab-patch" hidden>
   <section class="intro">
     <p>Take a patch further: <strong>apply</strong> it to a document (YAML and TOML keep their comments and layout), <strong>undo</strong> it by inverting it, or <strong>squash</strong> several patches into one.</p>
     <label class="example">Try an example
@@ -177,6 +177,7 @@
       <input type="text" id="pt-ignore" class="keys wide" placeholder="e.g. /updatedAt" spellcheck="false" autocomplete="off">
     </label>
   </div>
+  <p class="muted" id="pt-live-note" hidden></p>
   <div id="pt-error" class="error" role="alert" hidden></div>
   <section id="pt-results" hidden>
     <div class="toolbar">
@@ -191,6 +192,7 @@
 </main>
 
 <main class="wrap" id="shared">
+  <p class="muted" id="live-note" hidden></p>
   <div id="error" class="error" role="alert" hidden></div>
   <div id="loading" class="muted">Loading WebAssembly…</div>
 
@@ -199,12 +201,12 @@
     <div class="metrics" id="metrics"></div>
 
     <div class="tabs" role="tablist">
-      <button role="tab" class="tab active" data-tab="visual" aria-selected="true">Visual diff</button>
-      <button role="tab" class="tab" data-tab="ops" aria-selected="false">Operations <span class="count" id="count-ops"></span></button>
-      <button role="tab" class="tab" data-tab="raw" aria-selected="false">Raw output</button>
+      <button role="tab" class="tab active" id="tab-btn-visual" aria-controls="tab-visual" data-tab="visual" aria-selected="true">Visual diff</button>
+      <button role="tab" class="tab" id="tab-btn-ops" aria-controls="tab-ops" data-tab="ops" aria-selected="false">Operations <span class="count" id="count-ops"></span></button>
+      <button role="tab" class="tab" id="tab-btn-raw" aria-controls="tab-raw" data-tab="raw" aria-selected="false">Raw output</button>
     </div>
 
-    <div class="tabpanel" id="tab-visual">
+    <div class="tabpanel" role="tabpanel" aria-labelledby="tab-btn-visual" id="tab-visual">
       <div class="toolbar">
         <div class="legend">
           <span class="chip added">added</span><span class="chip removed">removed</span><span class="chip changed">changed</span><span class="chip ignored" id="legend-ignored" hidden>ignored</span>
@@ -216,7 +218,7 @@
       <div class="sbs" id="sbs" role="table" aria-label="Side by side diff"></div>
     </div>
 
-    <div class="tabpanel" id="tab-ops" hidden>
+    <div class="tabpanel" role="tabpanel" aria-labelledby="tab-btn-ops" id="tab-ops" hidden>
       <div class="toolbar">
         <div class="filters" id="op-filters"></div>
         <input type="search" id="op-search" placeholder="Filter by path or value…" aria-label="Filter operations">
@@ -224,7 +226,7 @@
       <div class="table-wrap"><table class="ops"><thead><tr><th>Op</th><th>Path</th><th>Value</th></tr></thead><tbody id="ops-body"></tbody></table></div>
     </div>
 
-    <div class="tabpanel" id="tab-raw" hidden>
+    <div class="tabpanel" role="tabpanel" aria-labelledby="tab-btn-raw" id="tab-raw" hidden>
       <div class="toolbar">
         <div class="seg" role="group" aria-label="Raw format">
           <button class="seg-btn active" data-raw="json">RFC 6902 JSON</button>
