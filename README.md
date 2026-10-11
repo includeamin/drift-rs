@@ -415,12 +415,60 @@ the list each time, which made a keyed diff quadratic in the number of rows
 (80,000 rows took 3.5 s), and equal values were walked field by field instead of
 being skipped.
 
+#### Files with more rows than fit in memory
+
+The index above takes about 130 bytes a row across the two files. For files too
+big for that, give a budget:
+
+```bash
+drift diff --array-key id --memory-limit 256M old.ndjson new.ndjson
+drift diff --array-key id --memory-limit 2G --temp-dir /mnt/scratch old.csv new.csv
+```
+
+```rust
+let options = RecordOptions::new().key("id").memory_limit(256 << 20);
+```
+
+Each file is scanned once and its rows are sorted by key through temporary files
+(an external merge sort), the two sorted streams are merge-joined, and what the
+join finds is sorted again into file order. Rows are read back from the files only
+where an operation needs them, and operations are written as they are found, so
+nothing is held per row. The operations are the ones the default gives, repeated
+keys and `--keyless` included.
+
+- **It is a budget, not a cap.** About an eighth of the limit goes to each of the
+  sort buffers, and a few more megabytes to read buffers, so the process takes
+  somewhat more than the limit when the limit is small. Memory does not grow with
+  the number of rows.
+- **Rows in both files must be in the same order in each**, which holds when one
+  file is a later version of the other. Otherwise the diff has to emit `move`s, and
+  working those out takes memory for every row. If the rows seem to fit in the
+  limit (about 64 bytes a row) the diff is then done in memory; if not, it is an
+  error before any output is written.
+- **It is slower** than the default for files that fit in memory, and needs disk
+  space for the sort: roughly 50 bytes a row for each file, in `--temp-dir`.
+  Temporary files are removed when the diff ends, fails or is stopped.
+
+Measured on generated NDJSON files of 1 and 4 million rows (137 MB and 554 MB
+each; about 1% of rows changed, 0.5% removed and 0.5% added), on a busy machine
+(load average above 10), so the times are only indicative:
+
+| Rows | Mode | Peak memory | Time |
+|---|---|---|---|
+| 1 M | in memory | 120 MB | 9-17 s |
+| 1 M | `--memory-limit 64M` | 29 MB | 7-8 s |
+| 1 M | `--memory-limit 256M` | 101 MB | 5 s |
+| 4 M | in memory | 600 MB | 121 s |
+| 4 M | `--memory-limit 64M` | 32 MB | 44 s |
+| 4 M | `--memory-limit 256M` | 101 MB | 41 s |
+
+Peak memory with a limit stays flat as the files grow; the in-memory figure does
+not.
+
 Limits: NDJSON rows must be JSON objects (except with `--keyless`), and record
-files cannot come from stdin or be used with `--grep`. Memory is still proportional to the
-number of rows, about 130 bytes a row across the two files, so a billion rows is
-too many for one machine's RAM; sorting or partitioning the index on disk would
-remove that, at the cost of a different output model for reordered rows. Rows with
-equal hashes are treated as equal, which is wrong only for a 128-bit collision.
+files cannot come from stdin or be used with `--grep`. Without `--memory-limit`
+memory is proportional to the number of rows. Rows with equal hashes are treated as
+equal, which is wrong only for a 128-bit collision.
 
 ### Lower-level APIs
 
