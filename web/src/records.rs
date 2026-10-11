@@ -2,8 +2,8 @@
 //! `drift diff` command gives for NDJSON, CSV and TSV files.
 //!
 //! The command works on files and never holds the rows. Here the text is already
-//! in memory, so each row is wrapped as `{"k": key, "r": row}` and the two lists
-//! are diffed as arrays matched by `k`, which is what the command's planner does;
+//! in memory, so each row is wrapped as `{KEY: key, ROW: row}` and the two lists
+//! are diffed as arrays matched by the key member, which is what the command's planner does;
 //! the wrapper is taken off the operations afterwards.
 
 use crate::clock::Clock;
@@ -12,6 +12,11 @@ use crate::{list, measure, Metrics, Side};
 use drift::{diff_with, patch, split_pointer, DiffOptions, Operation};
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, HashMap};
+
+/// The members a row is wrapped in. Their names start with a control character so
+/// they cannot be a field of a row, or of anything inside one.
+const KEY: &str = "\u{1}k";
+const ROW: &str = "\u{1}r";
 
 #[derive(Clone, Copy, PartialEq)]
 enum Policy {
@@ -48,12 +53,17 @@ fn parse_rows(text: &str, format: &str) -> Result<Vec<(usize, Value)>, String> {
                 .from_reader(text.as_bytes());
             let header: Vec<String> = reader
                 .headers()
-                .map_err(|e| format!("header: {e}"))?
+                .map_err(|e| format!("line 1: {e}"))?
                 .iter()
                 .map(String::from)
                 .collect();
-            if let Some(empty) = header.iter().position(String::is_empty) {
-                return Err(format!("header: column {} has no name", empty + 1));
+            for (at, name) in header.iter().enumerate() {
+                if name.is_empty() {
+                    return Err("line 1: a column name is empty".to_string());
+                }
+                if header[..at].contains(name) {
+                    return Err(format!("line 1: the column `{name}` appears twice in the header"));
+                }
             }
             let mut rows = Vec::new();
             for record in reader.records() {
@@ -98,11 +108,14 @@ fn canonical(value: &Value) -> String {
 }
 
 fn key_of(row: &Value, fields: &[&str], line: usize) -> Result<String, String> {
+    if !row.is_object() {
+        return Err(format!("line {line}: a row must be a JSON object"));
+    }
     let mut parts = Vec::with_capacity(fields.len());
     for field in fields {
         let found = if field.starts_with('/') { row.pointer(field) } else { row.get(field) };
         match found {
-            None => return Err(format!("line {line}: the row has no `{field}`")),
+            None => return Err(format!("line {line}: the row has no `{field}` field")),
             Some(v @ (Value::String(_) | Value::Number(_) | Value::Bool(_))) => {
                 parts.push(v.clone())
             }
@@ -112,6 +125,15 @@ fn key_of(row: &Value, fields: &[&str], line: usize) -> Result<String, String> {
         }
     }
     Ok(Value::Array(parts).to_string())
+}
+
+/// A key as the command prints it: the value itself for one field, an array for
+/// several.
+fn key_text(key: &str) -> String {
+    match serde_json::from_str::<Value>(key) {
+        Ok(Value::Array(parts)) if parts.len() == 1 => parts[0].to_string(),
+        _ => key.to_string(),
+    }
 }
 
 fn prepare(
@@ -132,7 +154,8 @@ fn prepare(
             for (line, key, _) in &keyed {
                 if let Some(earlier) = first.insert(key, *line) {
                     return Err(format!(
-                        "line {line}: duplicate key {key} (first seen at line {earlier})"
+                        "line {line}: duplicate key {} (first seen at line {earlier})",
+                        key_text(key)
                     ));
                 }
             }
@@ -173,14 +196,31 @@ fn prepare(
                 .collect()
         }
     };
-    let kept = kept.into_iter().map(|(key, row)| json!({"k": key, "r": row})).collect();
+    let kept = kept.into_iter().map(|(key, row)| json!({KEY: key, ROW: row})).collect();
     Ok(Rows { kept, total })
+}
+
+/// An ignore pattern for rows, as one for wrapped rows: the row's own part follows
+/// its position. A pattern that stops at the row, or starts with `**` (which
+/// reaches through the wrapper anyway), is left as it is. One that matches
+/// everything stops at each row, since the list of rows is not part of the rows.
+fn wrap_pattern(pattern: &str) -> String {
+    let Some(rest) = pattern.strip_prefix('/') else { return pattern.to_string() };
+    // Rows are never ignored as a whole by the command's own root, which is not a
+    // row: a pattern that reaches everything reaches each row.
+    if rest.split('/').all(|token| token == "**") {
+        return "/*".to_string();
+    }
+    match rest.split_once('/') {
+        Some((first, after)) if first != "**" => format!("/{first}/{ROW}/{after}"),
+        _ => pattern.to_string(),
+    }
 }
 
 /// Takes the wrapper off a path: `/3/r/name` is `/3/name`.
 fn unwrap_path(path: &str) -> String {
     match split_pointer(path) {
-        Ok(tokens) if tokens.len() >= 2 && tokens[1] == "r" => {
+        Ok(tokens) if tokens.len() >= 2 && tokens[1] == ROW => {
             let mut rest = vec![tokens[0].clone()];
             rest.extend(tokens[2..].iter().cloned());
             rest.iter().fold(String::new(), |path, token| drift::join_pointer(&path, token))
@@ -191,7 +231,7 @@ fn unwrap_path(path: &str) -> String {
 
 /// A wrapped row's own value.
 fn unwrap_value(value: &mut Value) {
-    if let Some(row) = value.get_mut("r").map(Value::take) {
+    if let Some(row) = value.get_mut(ROW).map(Value::take) {
         *value = row;
     }
 }
@@ -213,7 +253,7 @@ fn unwrap_tree(mut root: Node) -> Node {
 
 fn unwrap_row(mut row: Node) -> Node {
     if row.status == Status::Nested {
-        if let Some(at) = row.children.iter().position(|c| c.key.as_deref() == Some("r")) {
+        if let Some(at) = row.children.iter().position(|c| c.key.as_deref() == Some(ROW)) {
             let mut inner = row.children.swap_remove(at);
             inner.key = row.key;
             inner.old_index = row.old_index;
@@ -229,7 +269,7 @@ fn unwrap_row(mut row: Node) -> Node {
 
 /// The wrapped rows as the rows they hold.
 fn rows_of(wrapped: &[Value]) -> Value {
-    Value::Array(wrapped.iter().map(|row| row["r"].clone()).collect())
+    Value::Array(wrapped.iter().map(|row| row[ROW].clone()).collect())
 }
 
 pub fn run(
@@ -264,13 +304,9 @@ pub fn run(
     let new = prepare(new_rows, &fields, keyless, policy).map_err(|e| format!("new: {e}"))?;
 
     // The command's patterns name rows as `/*/field`; inside the wrapper that is
-    // `/*/r/field`.
-    let options = list(ignore_paths).fold(DiffOptions::new().array_key("k"), |o, pattern| {
-        match pattern.strip_prefix("/*") {
-            Some(rest) => o.ignore_path(format!("/*/r{rest}")),
-            None => o.ignore_path(pattern),
-        }
-    });
+    // `/*/<ROW>/field`.
+    let options = list(ignore_paths)
+        .fold(DiffOptions::new().array_key(KEY), |o, pattern| o.ignore_path(wrap_pattern(pattern)));
     let (old_list, new_list) = (Value::Array(old.kept.clone()), Value::Array(new.kept.clone()));
     let clock = Clock::start();
     let deltas = diff_with(&new_list, &old_list, &options);
@@ -300,7 +336,7 @@ pub fn run(
             delta.from_path = delta.from_path.as_deref().map(unwrap_path);
             if delta.op == Operation::Add && split_pointer(&delta.path).is_ok_and(|t| t.len() == 1)
             {
-                delta.value = delta.value.and_then(|wrapped| wrapped.get("r").cloned());
+                delta.value = delta.value.and_then(|wrapped| wrapped.get(ROW).cloned());
             }
             *by_op.entry(delta.op.as_str()).or_insert(0) += 1;
             serde_json::to_value(&delta).unwrap_or(Value::Null)
@@ -353,9 +389,12 @@ mod tests {
     use drift::{diff_records_with, CsvOptions, Duplicates, RecordFormat, RecordOptions};
 
     fn write(name: &str, text: &str) -> std::path::PathBuf {
+        // Tests run side by side: every file gets a name of its own.
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let dir = std::env::temp_dir().join(format!("drift-web-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join(name);
+        let path =
+            dir.join(format!("{}-{name}", NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst)));
         std::fs::write(&path, text).unwrap();
         path
     }
@@ -473,7 +512,7 @@ mod tests {
                 // The tree is of the rows, not of how they were wrapped, and each of
                 // its changes is one operation.
                 let text = report["tree"].to_string();
-                assert!(!text.contains("\"k\":") && !text.contains("\"r\":"), "{text}");
+                assert!(!text.contains('\u{1}') && !text.contains("\\u0001"), "{text}");
                 let (changed, moved) = count(&report["tree"]);
                 assert_eq!(
                     changed + moved,
@@ -501,7 +540,7 @@ mod tests {
         let e = run(ok, "{\"id\":1}\n{\"id\":1}\n", "ndjson", "id", "", false, "").unwrap_err();
         assert!(e.starts_with("new: line 2: duplicate key"), "{e}");
         let e = run("{\"x\":1}\n", ok, "ndjson", "id", "", false, "").unwrap_err();
-        assert_eq!(e, "old: line 1: the row has no `id`");
+        assert_eq!(e, "old: line 1: the row has no `id` field");
         let e = run(ok, "{\"id\":\n", "ndjson", "id", "", false, "").unwrap_err();
         assert!(e.starts_with("new: line 1:"), "{e}");
         assert!(run(ok, ok, "ndjson", "", "", false, "").unwrap_err().contains("give the key"));
@@ -528,5 +567,125 @@ mod tests {
         let rows = &report["metrics"]["rows"];
         assert_eq!((rows["old"].as_u64(), rows["new"].as_u64()), (Some(1), Some(2)));
         assert_eq!(report["metrics"]["roundtrip_ok"], true);
+    }
+
+    /// The command's error for the same input, with its file name as the side.
+    fn command_error(old: &str, new: &str, format: &str, key: &str, dups: &str) -> String {
+        let (o, n) = (write(&format!("eo.{format}"), old), write(&format!("en.{format}"), new));
+        let mut options = RecordOptions::new();
+        if format != "ndjson" {
+            options = options.format(RecordFormat::Csv(CsvOptions::new()));
+        }
+        for field in list(key) {
+            options = options.key(field);
+        }
+        if dups == "error" {
+            options = options.duplicates(Duplicates::Error);
+        }
+        let message = diff_records_with(&o, &n, &options).unwrap_err().to_string();
+        message
+            .trim_start_matches("parse error: ")
+            .replace(&format!("{}: ", o.display()), "old: ")
+            .replace(&format!("{}: ", n.display()), "new: ")
+    }
+
+    #[test]
+    fn problems_read_as_the_command_reads_them() {
+        let good_json = "{\"id\":1}\n";
+        let good_csv = "id,v\n1,a\n";
+        let cases: [(&str, &str, &str, &str); 12] = [
+            ("ndjson", "{\"id\":1}\n{\"id\":2}\n{\"id\":1}\n", good_json, "id"),
+            ("ndjson", good_json, "{\"id\":\"a\"}\n{\"id\":\"a\"}\n", "id"),
+            ("ndjson", "{\"id\":1,\"r\":2}\n{\"id\":1,\"r\":2}\n", good_json, "id,r"),
+            ("ndjson", "{\"x\":1}\n", good_json, "id"),
+            ("ndjson", good_json, "{\"id\":[1]}\n", "id"),
+            ("ndjson", good_json, "{\"id\":1}\n[1,2]\n", "id"),
+            ("ndjson", good_json, "{\"id\":1}\n5\n", "id"),
+            ("ndjson", "{\"id\":\n", good_json, "id"),
+            ("csv", "id,id\n1,a\n", good_csv, "id"),
+            ("csv", good_csv, "id,v,v\n1,a,b\n", "id"),
+            ("csv", good_csv, "id,v\n1,a\n2\n", "id"),
+            ("csv", "id,,v\n1,a,b\n", good_csv, "id"),
+        ];
+        for (format, old, new, key) in cases {
+            let expected = command_error(old, new, format, key, "error");
+            let got = run(old, new, format, key, "", false, "").unwrap_err();
+            assert_eq!(got, expected, "{format} {old:?} -> {new:?}");
+        }
+    }
+
+    #[test]
+    fn nested_rows_fields_named_k_and_r_and_every_kind_of_ignore_pattern_match_the_command() {
+        let mut state = 0xD1B54A32D192ED03u64;
+        let mut next = move |n: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % n
+        };
+        // The patterns the command accepts, whatever they reach.
+        let patterns = [
+            "",
+            "/*/v",
+            "/**/v",
+            "/**",
+            "/0/v",
+            "/0",
+            "/*",
+            "/*/meta/v",
+            "/*/t/*/v",
+            "/**/k",
+            "/*/r",
+            "/*/k",
+            "/*/t",
+            "/*/*",
+            "/1/meta/v, /*/k",
+        ];
+        for round in 0..400 {
+            let pattern = patterns[round % patterns.len()];
+            let (key, dups, keyless) = match round % 4 {
+                0 => ("id", "", false),
+                1 => ("id,r", "", false),
+                2 => ("id", "last", false),
+                _ => ("", "", true),
+            };
+            let unique = dups.is_empty() && !keyless;
+            let make = |next: &mut dyn FnMut(u64) -> u64| -> Vec<Value> {
+                let mut rows: Vec<Value> = (0..next(7))
+                    .map(|_| {
+                        // Inner lists of objects with fields named k and r, which must
+                        // be matched as the command matches them: by position.
+                        let items: Vec<Value> = (0..next(4))
+                            .map(|_| {
+                                let k = ["a", "b", "c"][next(3) as usize];
+                                json!({"k": k, "r": next(2), "v": next(2)})
+                            })
+                            .collect();
+                        json!({
+                            "id": next(5), "r": next(2), "k": next(2), "v": next(3),
+                            "meta": {"v": next(2), "n": next(2)}, "t": items,
+                        })
+                    })
+                    .collect();
+                if unique {
+                    let mut seen = std::collections::HashSet::new();
+                    rows.retain(|r| seen.insert((r["id"].clone(), r["r"].clone())));
+                }
+                rows
+            };
+            let text = |rows: &[Value]| rows.iter().map(|r| format!("{r}\n")).collect::<String>();
+            let (old, new) = (text(&make(&mut next)), text(&make(&mut next)));
+            let expected = command(&old, &new, "ndjson", key, dups, keyless, pattern);
+            let got = run(&old, &new, "ndjson", key, dups, keyless, pattern)
+                .map(|report| report["operations"].as_array().unwrap().clone());
+            match (&got, &expected) {
+                (Ok(got), Ok(expected)) => assert_eq!(
+                    got, expected,
+                    "round {round} pattern {pattern:?} key {key:?}: {old:?} -> {new:?}"
+                ),
+                (Err(_), Err(_)) => {}
+                _ => panic!("round {round}: {got:?} vs {expected:?}"),
+            }
+        }
     }
 }
