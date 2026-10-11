@@ -9,10 +9,10 @@ const el = (tag, cls, text) => {
 const fmtMs = (ms) => (ms < 0.001 ? "< 1 µs" : ms < 1 ? `${(ms * 1000).toFixed(0)} µs` : ms < 100 ? `${ms.toFixed(2)} ms` : `${ms.toFixed(0)} ms`);
 const debounce = (fn, ms) => { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; };
 
-const RECORD_EXAMPLES = [
+export const RECORD_EXAMPLES = [
   {
     name: "NDJSON · a row added at the front",
-    format: "ndjson", key: "id",
+    hint: "ndjson", key: "id",
     old: `{"id":1,"name":"Ada","plan":"free"}
 {"id":2,"name":"Grace","plan":"pro"}
 {"id":3,"name":"Linus","plan":"free"}
@@ -25,7 +25,7 @@ const RECORD_EXAMPLES = [
   },
   {
     name: "CSV · changed and removed rows",
-    format: "csv", key: "sku",
+    hint: "csv", key: "sku",
     old: `sku,name,price
 A-100,Widget,9.99
 A-101,Gadget,14.50
@@ -39,7 +39,7 @@ A-103,Doohickey,7.00
   },
   {
     name: "NDJSON · composite key (id + region)",
-    format: "ndjson", key: "id,region",
+    hint: "ndjson", key: "id,region",
     old: `{"id":1,"region":"eu","stock":5}
 {"id":1,"region":"us","stock":9}
 `,
@@ -49,7 +49,7 @@ A-103,Doohickey,7.00
   },
   {
     name: "NDJSON · keyless, rows matched by content",
-    format: "ndjson", key: "", keyless: true,
+    hint: "ndjson", key: "", keyless: true,
     old: `{"event":"login","user":"ada"}
 {"event":"login","user":"ada"}
 {"event":"logout","user":"ada"}
@@ -61,7 +61,7 @@ A-103,Doohickey,7.00
   },
   {
     name: "NDJSON · repeated keys (keep the last)",
-    format: "ndjson", key: "id", dups: "last",
+    hint: "ndjson", key: "id", dups: "last",
     old: `{"id":1,"v":"a"}
 {"id":1,"v":"b"}
 {"id":2,"v":"c"}
@@ -131,7 +131,7 @@ connections = 100
   },
 ];
 
-export function initModes(wasm, diffState) {
+export function initModes(wasm, diffState, onMode) {
   // ---- switcher ----
   const modes = ["diff", "records", "patch"];
   function showMode(name) {
@@ -142,6 +142,7 @@ export function initModes(wasm, diffState) {
       b.setAttribute("aria-selected", String(on));
     }
     try { history.replaceState(null, "", name === "diff" ? location.pathname : `#${name}`); } catch { /* not allowed in some contexts */ }
+    onMode(name);
   }
   document.querySelectorAll(".mode").forEach((b) => b.addEventListener("click", () => showMode(b.dataset.mode)));
 
@@ -151,97 +152,29 @@ export function initModes(wasm, diffState) {
     setTimeout(() => (button.textContent = "Copy"), 1200);
   });
 
-  // ---- records ----
-  const rec = { report: null, filter: new Set() };
-
-  function recError(message) {
-    $("rec-error").textContent = message;
-    $("rec-error").hidden = false;
-    $("rec-results").hidden = true;
-  }
-
-  function recCompare() {
-    const oldText = $("rec-old").value, newText = $("rec-new").value;
-    if (!oldText.trim() && !newText.trim()) return;
-    let result;
-    try {
-      result = JSON.parse(wasm.run_records(oldText, newText, $("rec-format").value, $("rec-key").value, $("rec-dups").value, $("rec-keyless").checked, $("rec-ignore").value));
-    } catch (err) { recError(`Unexpected failure: ${err}`); return; }
-    if (!result.ok) { recError(result.error); return; }
-    $("rec-error").hidden = true;
-    rec.report = result;
-    recRender();
-  }
-
-  function recMetric(label, value, sub) {
-    const card = el("div", "metric");
-    card.append(el("div", "label", label), el("div", "value", value));
-    if (sub) card.append(el("div", "sub", sub));
-    return card;
-  }
-
-  function recRender() {
-    const r = rec.report;
-    $("rec-results").hidden = false;
-    const box = $("rec-metrics");
-    box.replaceChildren();
-    box.append(recMetric("Operations", String(r.operations.length), Object.entries(r.by_op).map(([k, v]) => `${v} ${k}`).join(" · ") || "the files hold the same rows"));
-    const used = (n, total) => (n === total ? `${total} rows` : `${n} of ${total} rows used`);
-    box.append(recMetric("Old file", used(r.old_used, r.old_rows), "rows after repeated keys are resolved"));
-    box.append(recMetric("New file", used(r.new_used, r.new_rows)));
-    box.append(recMetric("Diff time", fmtMs(r.diff_ms), `total ${fmtMs(r.total_ms)}`));
-
-    const filters = $("rec-filters");
-    filters.replaceChildren();
-    for (const [op, count] of Object.entries(r.by_op)) {
-      const b = el("button", "filter", `${op} ${count}`);
-      b.type = "button";
-      b.setAttribute("aria-pressed", String(rec.filter.has(op)));
-      b.addEventListener("click", () => { rec.filter.has(op) ? rec.filter.delete(op) : rec.filter.add(op); recRender(); });
-      filters.append(b);
-    }
-    const body = $("rec-body");
-    body.replaceChildren();
-    let shown = 0;
-    for (const op of r.operations) {
-      if (rec.filter.size && !rec.filter.has(op.op)) continue;
-      if (shown++ >= 2000) break;
-      const tr = el("tr");
-      const text = "value" in op ? JSON.stringify(op.value) : op.from ? `from ${op.from}` : "";
-      tr.append(el("td", `op ${op.op}`, op.op), el("td", "", op.path || "(root)"), el("td", "val", text.length > 300 ? text.slice(0, 300) + "…" : text));
-      body.append(tr);
-    }
-    if (!shown) {
-      const tr = el("tr"); const td = el("td", "val", r.operations.length ? "No operations match the filter." : "No differences.");
-      td.colSpan = 3; tr.append(td); body.append(tr);
-    }
-  }
-
-  const recSelect = $("rec-example");
-  RECORD_EXAMPLES.forEach((ex, i) => recSelect.append(new Option(ex.name, String(i))));
-  recSelect.addEventListener("change", () => {
-    const ex = RECORD_EXAMPLES[Number(recSelect.value)];
-    if (!ex) return;
-    $("rec-old").value = ex.old; $("rec-new").value = ex.new;
-    $("rec-format").value = ex.format; $("rec-key").value = ex.key;
-    $("rec-keyless").checked = !!ex.keyless; $("rec-dups").value = ex.dups ?? ""; $("rec-ignore").value = "";
-    recCompare();
-  });
-  $("rec-run").addEventListener("click", recCompare);
-  const recLive = debounce(recCompare, 350);
-  for (const id of ["rec-old", "rec-new", "rec-key", "rec-ignore"]) $(id).addEventListener("input", recLive);
-  for (const id of ["rec-format", "rec-dups", "rec-keyless"]) $(id).addEventListener("change", recCompare);
-  copyButton($("rec-copy"), () => rec.report?.raw_pretty ?? "");
+  const fmtBytes = (n) => (n < 1024 ? `${n} B` : n < 1048576 ? `${(n / 1024).toFixed(1)} KB` : `${(n / 1048576).toFixed(2)} MB`);
 
   // ---- apply, undo, squash ----
+  const pt = { last: "apply", hint: "", output: null };
+
   function ptError(message) {
     $("pt-error").textContent = message;
     $("pt-error").hidden = false;
     $("pt-results").hidden = true;
   }
 
+  function ptFooters() {
+    const doc = $("pt-doc").value;
+    $("pt-detected").textContent = doc.trim() ? `detected: ${wasm.detect_format(doc, $("pt-format").value || pt.hint)}` : "";
+    for (const [id, text] of [["pt-foot-doc", doc], ["pt-foot-patch", $("pt-patch").value]]) {
+      $(id).textContent = text.trim() ? `${fmtBytes(new Blob([text]).size)} · ${text.split("\n").length} lines` : "";
+    }
+  }
+
   function ptRun(kind) {
-    const doc = $("pt-doc").value, patch = $("pt-patch").value, hint = $("pt-format").value;
+    pt.last = kind;
+    const doc = $("pt-doc").value, patch = $("pt-patch").value, hint = $("pt-format").value || pt.hint;
+    if (!doc.trim() && !patch.trim()) return;
     if (!doc.trim() || !patch.trim()) { ptError("Paste a document and a patch first."); return; }
     let result;
     try {
@@ -253,28 +186,72 @@ export function initModes(wasm, diffState) {
     if (!result.ok) { ptError(result.error); return; }
     $("pt-error").hidden = true;
     $("pt-results").hidden = false;
+    for (const [id, name] of [["pt-apply", "apply"], ["pt-invert", "invert"], ["pt-compose", "compose"]]) $(id).classList.toggle("primary", name === kind);
     const note = $("pt-note");
     note.className = "muted";
     if (kind === "apply") {
+      pt.output = { text: result.text, name: `patched.${result.format}`, type: "text/plain" };
       $("pt-title").textContent = `Patched ${result.format} document`;
-      $("pt-out").textContent = result.text;
       if (result.kept) { note.textContent = "Comments and layout of the original were kept."; note.className = "note-ok"; }
       else if (result.preserving) note.textContent = "Nothing in this document needed keeping, or it could not be edited in place, so it was written fresh.";
       else note.textContent = `${result.format.toUpperCase()} has no comments to keep: the document was written fresh.`;
-    } else if (kind === "invert") {
-      $("pt-title").textContent = "The patch that undoes it";
-      $("pt-out").textContent = result.patch;
-      note.textContent = `${result.before} operation${result.before === 1 ? "" : "s"} → ${result.after} to undo them. Apply this to the patched document to get the original back.`;
     } else {
-      $("pt-title").textContent = "One patch with the same effect";
-      $("pt-out").textContent = result.patch;
-      note.textContent = `${result.before} operation${result.before === 1 ? "" : "s"} squashed into ${result.after}.`;
+      const plural = (n) => `${n} operation${n === 1 ? "" : "s"}`;
+      pt.output = { text: result.patch, name: kind === "invert" ? "undo.json" : "squashed.json", type: "application/json" };
+      $("pt-title").textContent = kind === "invert" ? "The patch that undoes it" : "One patch with the same effect";
+      note.textContent = kind === "invert"
+        ? `${plural(result.before)} → ${result.after} to undo them. Apply this to the patched document to get the original back.`
+        : `${plural(result.before)} squashed into ${result.after}.`;
     }
+    $("pt-out").textContent = pt.output.text;
   }
+
   $("pt-apply").addEventListener("click", () => ptRun("apply"));
   $("pt-invert").addEventListener("click", () => ptRun("invert"));
   $("pt-compose").addEventListener("click", () => ptRun("compose"));
   copyButton($("pt-copy"), () => $("pt-out").textContent);
+  $("pt-download").addEventListener("click", () => {
+    if (!pt.output) return;
+    const a = el("a");
+    a.href = URL.createObjectURL(new Blob([pt.output.text], { type: pt.output.type }));
+    a.download = pt.output.name;
+    a.click();
+    URL.revokeObjectURL(a.href);
+  });
+
+  // Typing, dropping or uploading runs the last action again, as in the other tabs.
+  const live = debounce(() => { ptFooters(); if ($("pt-live").checked) ptRun(pt.last); }, 350);
+  const load = (id, file, isDoc) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      $(id).value = String(reader.result);
+      if (isDoc) { pt.hint = file.name; $("pt-format").value = ""; }
+      ptFooters(); ptRun(pt.last);
+    };
+    reader.readAsText(file);
+  };
+  for (const [paneId, areaId, fileId, isDoc] of [["pt-pane-doc", "pt-doc", "pt-file-doc", true], ["pt-pane-patch", "pt-patch", "pt-file-patch", false]]) {
+    $(fileId).addEventListener("change", (e) => e.target.files[0] && load(areaId, e.target.files[0], isDoc));
+    $(areaId).addEventListener("input", () => { if (isDoc) pt.hint = ""; live(); });
+    const pane = $(paneId);
+    pane.addEventListener("dragover", (e) => { e.preventDefault(); pane.classList.add("drag"); });
+    pane.addEventListener("dragleave", () => pane.classList.remove("drag"));
+    pane.addEventListener("drop", (e) => {
+      e.preventDefault();
+      pane.classList.remove("drag");
+      if (e.dataTransfer.files[0]) load(areaId, e.dataTransfer.files[0], isDoc);
+    });
+  }
+  $("pt-format").addEventListener("change", () => { ptFooters(); ptRun(pt.last); });
+  for (const id of ["pt-keys", "pt-ignore"]) $(id).addEventListener("input", live);
+  $("pt-clear").addEventListener("click", () => {
+    for (const id of ["pt-doc", "pt-patch"]) $(id).value = "";
+    pt.hint = ""; pt.output = null; ptFooters();
+    $("pt-results").hidden = true; $("pt-error").hidden = true; $("pt-example").value = "";
+  });
+  document.addEventListener("keydown", (e) => {
+    if ((e.ctrlKey || e.metaKey) && e.key === "Enter" && !$("mode-patch").hidden) ptRun(pt.last);
+  });
 
   const ptSelect = $("pt-example");
   PATCH_EXAMPLES.forEach((ex, i) => ptSelect.append(new Option(ex.name, String(i))));
@@ -282,17 +259,17 @@ export function initModes(wasm, diffState) {
     const ex = PATCH_EXAMPLES[Number(ptSelect.value)];
     if (!ex) return;
     $("pt-doc").value = ex.doc; $("pt-patch").value = ex.patch; $("pt-format").value = ex.format;
-    $("pt-keys").value = ""; $("pt-ignore").value = "";
-    ptRun(ex.run);
+    $("pt-keys").value = ""; $("pt-ignore").value = ""; pt.hint = "";
+    ptFooters(); ptRun(ex.run);
   });
 
   $("pt-from-diff").addEventListener("click", () => {
-    const report = diffState.report;
+    const report = diffState.reports.diff;
     if (!report) { ptError("Compute a diff in Compare documents first."); return; }
     $("pt-doc").value = $("text-old").value;
-    $("pt-format").value = "";
+    $("pt-format").value = ""; pt.hint = diffState.hints.diff.old;
     $("pt-patch").value = report.raw_pretty;
-    $("pt-error").hidden = true;
+    ptFooters(); ptRun("apply");
   });
 
   const wanted = location.hash.slice(1);

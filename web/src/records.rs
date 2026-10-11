@@ -7,8 +7,9 @@
 //! the wrapper is taken off the operations afterwards.
 
 use crate::clock::Clock;
-use crate::list;
-use drift::{diff_with, split_pointer, DiffOptions, Operation};
+use crate::tree::{self, Node, Status};
+use crate::{list, measure, Metrics, Side};
+use drift::{diff_with, patch, split_pointer, DiffOptions, Operation};
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, HashMap};
 
@@ -188,6 +189,49 @@ fn unwrap_path(path: &str) -> String {
     }
 }
 
+/// A wrapped row's own value.
+fn unwrap_value(value: &mut Value) {
+    if let Some(row) = value.get_mut("r").map(Value::take) {
+        *value = row;
+    }
+}
+
+/// The tree of two lists of wrapped rows, as the tree of the rows themselves: a
+/// row's node is its `r` node, keeping the row's position.
+fn unwrap_tree(mut root: Node) -> Node {
+    if root.status == Status::Nested {
+        root.children = root.children.into_iter().map(unwrap_row).collect();
+    } else {
+        for list in [&mut root.old, &mut root.new].into_iter().flatten() {
+            if let Value::Array(rows) = list {
+                rows.iter_mut().for_each(unwrap_value);
+            }
+        }
+    }
+    root
+}
+
+fn unwrap_row(mut row: Node) -> Node {
+    if row.status == Status::Nested {
+        if let Some(at) = row.children.iter().position(|c| c.key.as_deref() == Some("r")) {
+            let mut inner = row.children.swap_remove(at);
+            inner.key = row.key;
+            inner.old_index = row.old_index;
+            inner.moved_from = row.moved_from;
+            return inner;
+        }
+    }
+    for value in [&mut row.old, &mut row.new].into_iter().flatten() {
+        unwrap_value(value);
+    }
+    row
+}
+
+/// The wrapped rows as the rows they hold.
+fn rows_of(wrapped: &[Value]) -> Value {
+    Value::Array(wrapped.iter().map(|row| row["r"].clone()).collect())
+}
+
 pub fn run(
     old_text: &str,
     new_text: &str,
@@ -209,8 +253,12 @@ pub fn run(
         (_, true) => Policy::Occurrence,
         (_, false) => Policy::Error,
     };
+    let clock = Clock::start();
     let old_rows = parse_rows(old_text, format).map_err(|e| format!("old: {e}"))?;
+    let old_parse_ms = clock.elapsed_ms();
+    let clock = Clock::start();
     let new_rows = parse_rows(new_text, format).map_err(|e| format!("new: {e}"))?;
+    let new_parse_ms = clock.elapsed_ms();
     let total = Clock::start();
     let old = prepare(old_rows, &fields, keyless, policy).map_err(|e| format!("old: {e}"))?;
     let new = prepare(new_rows, &fields, keyless, policy).map_err(|e| format!("new: {e}"))?;
@@ -223,12 +271,28 @@ pub fn run(
             None => o.ignore_path(pattern),
         }
     });
+    let (old_list, new_list) = (Value::Array(old.kept.clone()), Value::Array(new.kept.clone()));
     let clock = Clock::start();
-    let deltas =
-        diff_with(&Value::Array(new.kept.clone()), &Value::Array(old.kept.clone()), &options);
+    let deltas = diff_with(&new_list, &old_list, &options);
     let diff_ms = clock.elapsed_ms();
 
-    let mut by_op: BTreeMap<&str, usize> = BTreeMap::new();
+    let clock = Clock::start();
+    let tree = unwrap_tree(tree::build(&old_list, &new_list, &options));
+    let tree_ms = clock.elapsed_ms();
+
+    let clock = Clock::start();
+    // As for documents: with ignored parts the check is that nothing differs
+    // outside them.
+    let roundtrip_ok = patch(old_list.clone(), &deltas).is_ok_and(|patched| {
+        if options.ignore_paths.is_empty() {
+            patched == new_list
+        } else {
+            diff_with(&new_list, &patched, &options).is_empty()
+        }
+    });
+    let patch_ms = clock.elapsed_ms();
+
+    let mut by_op: BTreeMap<&'static str, usize> = BTreeMap::new();
     let operations: Vec<Value> = deltas
         .into_iter()
         .map(|mut delta| {
@@ -243,16 +307,43 @@ pub fn run(
         })
         .collect();
     let raw_pretty = serde_json::to_string_pretty(&operations).unwrap_or_default();
+
+    let side = |text: &str, rows: &[Value], parse_ms: f64| {
+        let (nodes, depth) = measure(&rows_of(rows));
+        Side {
+            format: match format {
+                "csv" => "csv",
+                "tsv" => "tsv",
+                _ => "ndjson",
+            },
+            bytes: text.len(),
+            lines: text.lines().count(),
+            nodes,
+            depth,
+            parse_ms,
+        }
+    };
+    let metrics = Metrics {
+        old: side(old_text, &old.kept, old_parse_ms),
+        new: side(new_text, &new.kept, new_parse_ms),
+        diff_ms,
+        tree_ms,
+        patch_ms,
+        total_ms: total.elapsed_ms() + old_parse_ms + new_parse_ms,
+        operations: operations.len(),
+        by_op,
+        roundtrip_ok,
+        version: drift::VERSION,
+    };
+    let mut metrics = serde_json::to_value(&metrics).map_err(|e| e.to_string())?;
+    metrics["rows"] = json!({
+        "old": old.total, "new": new.total, "old_used": old.kept.len(), "new_used": new.kept.len(),
+    });
     Ok(json!({
         "operations": operations,
+        "tree": serde_json::to_value(&tree).map_err(|e| e.to_string())?,
+        "metrics": metrics,
         "raw_pretty": raw_pretty,
-        "by_op": by_op,
-        "old_rows": old.total,
-        "new_rows": new.total,
-        "old_used": old.kept.len(),
-        "new_used": new.kept.len(),
-        "diff_ms": diff_ms,
-        "total_ms": total.elapsed_ms(),
     }))
 }
 
@@ -305,6 +396,19 @@ mod tests {
         diff_records_with(&o, &n, &options)
             .map(|ops| ops.iter().map(|d| serde_json::to_value(d).unwrap()).collect())
             .map_err(|e| e.to_string())
+    }
+
+    /// Added, removed and changed nodes, and moved ones, in a tree as JSON.
+    fn count(node: &Value) -> (usize, usize) {
+        let own =
+            usize::from(matches!(node["status"].as_str(), Some("added" | "removed" | "changed")));
+        let moved = usize::from(node.get("moved_from").is_some());
+        node["children"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(count)
+            .fold((own, moved), |(a, b), (c, d)| (a + c, b + d))
     }
 
     #[test]
@@ -364,8 +468,21 @@ mod tests {
             };
             let (old, new) = (text(&make(&mut next)), text(&make(&mut next)));
             let expected = command(&old, &new, format, key, duplicates, keyless, ignore);
-            let got = run(&old, &new, format, key, duplicates, keyless, ignore)
-                .map(|report| report["operations"].as_array().unwrap().clone());
+            let report = run(&old, &new, format, key, duplicates, keyless, ignore);
+            if let Ok(report) = &report {
+                // The tree is of the rows, not of how they were wrapped, and each of
+                // its changes is one operation.
+                let text = report["tree"].to_string();
+                assert!(!text.contains("\"k\":") && !text.contains("\"r\":"), "{text}");
+                let (changed, moved) = count(&report["tree"]);
+                assert_eq!(
+                    changed + moved,
+                    report["operations"].as_array().unwrap().len(),
+                    "round {round} {format} {key}: {old:?} -> {new:?}\n{text}"
+                );
+                assert_eq!(report["metrics"]["roundtrip_ok"], true, "round {round}");
+            }
+            let got = report.map(|report| report["operations"].as_array().unwrap().clone());
             match (&got, &expected) {
                 (Ok(got), Ok(expected)) => {
                     assert_eq!(got, expected, "round {round} {format} {key}: {old:?} -> {new:?}")
@@ -408,6 +525,8 @@ mod tests {
             report["operations"],
             json!([{"op": "add", "path": "/0", "value": {"id": 0, "v": 0}}])
         );
-        assert_eq!((report["old_rows"].as_u64(), report["new_rows"].as_u64()), (Some(1), Some(2)));
+        let rows = &report["metrics"]["rows"];
+        assert_eq!((rows["old"].as_u64(), rows["new"].as_u64()), (Some(1), Some(2)));
+        assert_eq!(report["metrics"]["roundtrip_ok"], true);
     }
 }

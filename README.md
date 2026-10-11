@@ -41,10 +41,11 @@ drop two JSON, YAML, TOML or XML documents to get a side-by-side visual diff,
 the RFC 6902 operations, and metrics (parse and diff time, sizes, operation
 counts, and a patch round-trip check). Two more tabs cover the rest:
 
-- **Compare records**: paste two NDJSON, CSV or TSV files and match rows by a
-  key (composite keys, repeated-key policies, keyless mode and ignored fields
-  included). The result is the same as `drift diff --array-key` gives on files;
-  a test checks that on random input. Diffing files too big for memory
+- **Compare records**: paste, drop or upload two NDJSON, CSV or TSV files and
+  match rows by a key (composite keys, repeated-key policies, keyless mode and ignored fields
+  included). It has the same controls and results as the first tab (visual
+  diff, operations, raw output, metrics). The operations are the same as
+  `drift diff --array-key` gives on files; a test checks that on random input. Diffing files too big for memory
   (`--memory-limit`) needs a disk, so it is command-line only.
 - **Apply, undo & squash**: apply an RFC 6902 patch to a document (YAML and TOML
   keep their comments and layout), invert it to get the patch that undoes it, or
