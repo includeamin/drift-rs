@@ -401,6 +401,7 @@ fn reading_only_the_key_agrees_with_parsing_the_whole_row() {
                 Err(Fault::BadKey(_)) => "bad key".to_string(),
                 Err(Fault::NotObject) => "not an object".to_string(),
                 Err(Fault::Json(e)) => panic!("{field} round {round}: {e}: {line}"),
+                Err(Fault::Io(e)) => panic!("{field} round {round}: {e}: {line}"),
             };
             assert_eq!(got, expected, "{field} round {round}: {line}");
         }
