@@ -3,21 +3,23 @@
 //!
 //! The in-memory diff builds a value tree for the whole document, which takes
 //! 26-35 times the size of the file. Here each file is read once into a compact
-//! index: per row, its key, a 128-bit fingerprint of its contents and where it
-//! sits in the file, whatever the row holds (about 100 MB for two files of
-//! 400,000 rows, against about 1.3 GB in memory). Rows are matched
-//! by key, rows with equal fingerprints are skipped without being parsed again,
-//! and only the rows that changed, or have to be added, are read back from disk.
+//! index of 40 bytes a row, whatever the row holds: a hash of the row's key, a
+//! hash of its bytes and where it starts in the file. The reading is done in
+//! parallel, parsing only the key out of each line. Rows are matched by key, rows
+//! whose bytes are equal are skipped without being parsed, and only the rows that
+//! differ, or have to be added, are read back from disk.
 //!
 //! The result is exactly what [`diff_with`](crate::diff_with) gives for the same
 //! rows as arrays matched by that key: the order of operations comes from the same
 //! planner, so the two can be used interchangeably.
 
-use crate::diff::{identity, plan_keyed, walk, Context, KeyedStep};
-use crate::{join_pointer, Delta, DiffOptions, DriftError, Operation};
+use crate::diff::{plan_keyed, walk, Context, KeyedStep};
+use crate::{join_pointer, split_pointer, Delta, DiffOptions, DriftError, Operation};
+use serde::de::{DeserializeSeed, Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde_json::Value;
+use std::cell::{Cell, RefCell};
 use std::collections::hash_map::DefaultHasher;
-use std::collections::HashMap;
+use std::fmt;
 use std::fs::File;
 use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
@@ -48,23 +50,32 @@ type Result<T> = std::result::Result<T, DriftError>;
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 ///
-/// Memory is the index of both files, about 250 bytes a row across the two, plus
-/// the operations themselves. Every row must be a JSON object whose `key` is a string, number
-/// or boolean, and keys must be unique in each file; anything else is an error
-/// naming the file and line.
+/// Memory is the index of both files, 40 bytes a row each, a few more bytes a
+/// row for matching and planning, and the operations themselves. Every row must be
+/// a JSON object whose `key` is a string, number or boolean, and keys must be
+/// unique in each file; anything else is an error naming the file and line.
 pub fn diff_records(
     old: &Path,
     new: &Path,
     key: &str,
     options: &DiffOptions,
 ) -> Result<Vec<Delta>> {
-    let old_rows = Rows::index(old, key)?;
-    let new_rows = Rows::index(new, key)?;
-    let old_by_key = old_rows.by_key()?;
-    new_rows.by_key()?;
-    let matches: Vec<Option<usize>> =
-        new_rows.keys.iter().map(|k| old_by_key.get(k.as_str()).copied()).collect();
-    drop(old_by_key);
+    let spec = KeySpec::parse(&[key.to_string()])?;
+    let old_rows = Rows::index(old, &spec)?;
+    let new_rows = Rows::index(new, &spec)?;
+    let old_order = old_rows.sorted_unique(&spec)?;
+    new_rows.sorted_unique(&spec)?;
+    let matches: Vec<Option<usize>> = new_rows
+        .keys
+        .iter()
+        .map(|key| {
+            old_order
+                .binary_search_by(|&row| old_rows.keys[row as usize].cmp(key))
+                .ok()
+                .map(|at| old_order[at] as usize)
+        })
+        .collect();
+    drop(old_order);
 
     let mut files = Files { old: open(old)?, new: open(new)? };
     let ctx = Context::new(options);
@@ -109,7 +120,9 @@ fn apply(
             out.push(Delta::with_value(Operation::Add, at(index), row));
         }
         KeyedStep::Pair { old: o, new: n } => {
-            // Equal fingerprints: the rows are the same, and nothing is read.
+            // Equal bytes: the rows are the same, and nothing is read. Rows that
+            // differ in bytes only (field order, spacing) are read and found equal
+            // by `walk`, which reports nothing for them.
             if old.hashes[o] != new.hashes[n] {
                 let (old_row, new_row) =
                     (old.read(&mut files.old, o)?, new.read(&mut files.new, n)?);
@@ -120,17 +133,142 @@ fn apply(
     Ok(())
 }
 
+/// Where the key of a row is: one field, or a JSON Pointer into the row.
+#[derive(Debug, Clone)]
+struct KeySpec {
+    /// What the user wrote, for messages.
+    label: String,
+    tokens: Vec<String>,
+}
+
+impl KeySpec {
+    fn parse(specs: &[String]) -> Result<KeySpec> {
+        let [spec] = specs else {
+            return Err(DriftError::Parse("exactly one key is supported".into()));
+        };
+        let tokens = if spec.starts_with('/') { split_pointer(spec)? } else { vec![spec.clone()] };
+        if tokens.is_empty() {
+            return Err(DriftError::Parse("a key must name a field".into()));
+        }
+        Ok(KeySpec { label: spec.clone(), tokens })
+    }
+}
+
+/// What can be wrong with a row, found while reading its key.
+enum Fault {
+    NotObject,
+    NoKey,
+    BadKey,
+    Json(serde_json::Error),
+}
+
+/// Reads the key out of one line without building the rest of the row: the other
+/// fields are skipped as they are read, which allocates nothing.
+fn read_key(line: &[u8], spec: &KeySpec) -> std::result::Result<Value, Fault> {
+    let found = RefCell::new(None);
+    let object = Cell::new(false);
+    let mut deserializer = serde_json::Deserializer::from_slice(line);
+    let seed = KeySeed { tokens: &spec.tokens, found: &found, object: &object };
+    seed.deserialize(&mut deserializer).map_err(Fault::Json)?;
+    deserializer.end().map_err(Fault::Json)?;
+    if !object.get() {
+        return Err(Fault::NotObject);
+    }
+    match found.into_inner() {
+        None => Err(Fault::NoKey),
+        Some(key @ (Value::String(_) | Value::Number(_) | Value::Bool(_))) => Ok(key),
+        Some(_) => Err(Fault::BadKey),
+    }
+}
+
+/// Walks one value, keeping the part at `tokens` and skipping everything else.
+struct KeySeed<'a> {
+    tokens: &'a [String],
+    found: &'a RefCell<Option<Value>>,
+    /// Set when the value being walked at the top is an object.
+    object: &'a Cell<bool>,
+}
+
+impl<'de> DeserializeSeed<'de> for KeySeed<'_> {
+    type Value = ();
+
+    fn deserialize<D: Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> std::result::Result<(), D::Error> {
+        deserializer.deserialize_any(self)
+    }
+}
+
+impl<'de> Visitor<'de> for KeySeed<'_> {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        formatter.write_str("a JSON value")
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> std::result::Result<(), A::Error> {
+        self.object.set(true);
+        let (head, rest) = self.tokens.split_first().expect("a key has a token");
+        while let Some(name) = map.next_key::<std::borrow::Cow<str>>()? {
+            if name == head.as_str() {
+                if rest.is_empty() {
+                    *self.found.borrow_mut() = Some(map.next_value::<Value>()?);
+                } else {
+                    // A nested object: its own `object` flag is irrelevant.
+                    let inner = Cell::new(false);
+                    map.next_value_seed(KeySeed {
+                        tokens: rest,
+                        found: self.found,
+                        object: &inner,
+                    })?;
+                }
+            } else {
+                map.next_value::<IgnoredAny>()?;
+            }
+        }
+        Ok(())
+    }
+
+    // Anything that is not an object holds no key; arrays still have to be read
+    // to their end.
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> std::result::Result<(), A::Error> {
+        while seq.next_element::<IgnoredAny>()?.is_some() {}
+        Ok(())
+    }
+    fn visit_bool<E>(self, _: bool) -> std::result::Result<(), E> {
+        Ok(())
+    }
+    fn visit_i64<E>(self, _: i64) -> std::result::Result<(), E> {
+        Ok(())
+    }
+    fn visit_u64<E>(self, _: u64) -> std::result::Result<(), E> {
+        Ok(())
+    }
+    fn visit_f64<E>(self, _: f64) -> std::result::Result<(), E> {
+        Ok(())
+    }
+    fn visit_str<E>(self, _: &str) -> std::result::Result<(), E> {
+        Ok(())
+    }
+    fn visit_unit<E>(self) -> std::result::Result<(), E> {
+        Ok(())
+    }
+}
+
 /// A file of records, indexed: one entry per row, in file order.
 struct Rows {
     path: PathBuf,
-    /// The value of each row's key field, as `to_string` of the JSON value, so
-    /// the number 1 and the string "1" are different keys.
-    keys: Vec<String>,
+    /// A 128-bit hash of each row's key. The number 1 and the string "1" are
+    /// different keys.
+    keys: Vec<u128>,
+    /// A 128-bit hash of each row's bytes, so equal lines are known to be equal
+    /// rows without being parsed.
     hashes: Vec<u128>,
-    /// 1-based line number of each row, for error messages.
-    lines: Vec<u32>,
-    /// Where each row's line starts in the file, and how long it is.
-    spans: Vec<(u64, u32)>,
+    /// Where each row's line starts. A row runs to the next row's start (or
+    /// `end`), which also takes in any blank lines after it: they are trimmed.
+    offsets: Vec<u64>,
+    end: u64,
 }
 
 fn open(path: &Path) -> Result<File> {
@@ -143,124 +281,241 @@ fn trim(line: &[u8]) -> &[u8] {
     &line[start..end]
 }
 
+/// The index of one stretch of a file.
+struct Part {
+    keys: Vec<u128>,
+    hashes: Vec<u128>,
+    offsets: Vec<u64>,
+}
+
+/// A row that could not be indexed: where its line starts, and what is wrong.
+struct Failure {
+    offset: u64,
+    fault: Fault,
+}
+
+/// Files smaller than this are indexed on one thread.
+const PARALLEL_FROM: u64 = 8 * 1024 * 1024;
+const MAX_THREADS: usize = 8;
+
 impl Rows {
     fn len(&self) -> usize {
         self.keys.len()
     }
 
-    fn error(&self, line: u32, message: impl std::fmt::Display) -> DriftError {
-        DriftError::Parse(format!("{}: line {line}: {message}", self.path.display()))
+    /// 1-based line number of `offset`, found by counting the lines before it.
+    /// Only errors need it, so it is not kept for every row.
+    fn line_of(&self, offset: u64) -> u32 {
+        let Ok(file) = File::open(&self.path) else { return 0 };
+        let mut reader = BufReader::with_capacity(1 << 20, file.take(offset));
+        let mut newlines = 0u32;
+        while let Ok(buffer) = reader.fill_buf() {
+            if buffer.is_empty() {
+                break;
+            }
+            newlines += buffer.iter().filter(|&&b| b == b'\n').count() as u32;
+            let consumed = buffer.len();
+            reader.consume(consumed);
+        }
+        newlines + 1
     }
 
-    fn index(path: &Path, key: &str) -> Result<Rows> {
+    fn error_at(&self, offset: u64, message: impl fmt::Display) -> DriftError {
+        DriftError::Parse(format!(
+            "{}: line {}: {message}",
+            self.path.display(),
+            self.line_of(offset)
+        ))
+    }
+
+    fn index(path: &Path, spec: &KeySpec) -> Result<Rows> {
+        let end = open(path)?
+            .metadata()
+            .map_err(|e| DriftError::Io(format!("{}: {e}", path.display())))?
+            .len();
+        let threads = if end < PARALLEL_FROM {
+            1
+        } else {
+            std::thread::available_parallelism().map_or(1, |n| n.get()).min(MAX_THREADS)
+        };
+        Rows::index_with(path, spec, threads)
+    }
+
+    fn index_with(path: &Path, spec: &KeySpec, threads: usize) -> Result<Rows> {
+        let end = open(path)?
+            .metadata()
+            .map_err(|e| DriftError::Io(format!("{}: {e}", path.display())))?
+            .len();
+        let bounds = chunk_bounds(path, end, threads)?;
+        let parts: Vec<std::result::Result<Part, Failure>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = bounds
+                .iter()
+                .map(|&(start, stop)| scope.spawn(move || index_part(path, start, stop, spec)))
+                .collect();
+            handles.into_iter().map(|h| h.join().expect("indexing does not panic")).collect()
+        });
+
         let mut rows = Rows {
             path: path.to_path_buf(),
             keys: Vec::new(),
             hashes: Vec::new(),
-            lines: Vec::new(),
-            spans: Vec::new(),
+            offsets: Vec::new(),
+            end,
         };
-        let mut reader = BufReader::with_capacity(1 << 20, open(path)?);
-        let (mut buffer, mut offset, mut line) = (Vec::new(), 0u64, 0u32);
-        loop {
-            buffer.clear();
-            let read = reader
-                .read_until(b'\n', &mut buffer)
-                .map_err(|e| DriftError::Io(format!("{}: {e}", path.display())))?;
-            if read == 0 {
-                return Ok(rows);
-            }
-            line += 1;
-            let start = offset;
-            offset += read as u64;
-            let text = trim(&buffer);
-            if text.is_empty() {
-                continue;
-            }
-            let row: Value = serde_json::from_slice(text).map_err(|e| rows.error(line, e))?;
-            let Value::Object(members) = &row else {
-                return Err(rows.error(line, "a row must be a JSON object"));
-            };
-            let identity = identity(&row, key).ok_or_else(|| {
-                if members.contains_key(key) {
-                    rows.error(line, format!("`{key}` must be a string, number or boolean"))
-                } else {
-                    rows.error(line, format!("the row has no `{key}` field"))
+        for part in parts {
+            match part {
+                Ok(part) => {
+                    rows.keys.extend(part.keys);
+                    rows.hashes.extend(part.hashes);
+                    rows.offsets.extend(part.offsets);
                 }
-            })?;
-            rows.keys.push(identity);
-            rows.hashes.push(fingerprint(&row));
-            rows.lines.push(line);
-            rows.spans.push((start, read as u32));
+                Err(Failure { offset, fault }) => {
+                    let message = match fault {
+                        Fault::NotObject => "a row must be a JSON object".to_string(),
+                        Fault::NoKey => format!("the row has no `{}` field", spec.label),
+                        Fault::BadKey => {
+                            format!("`{}` must be a string, number or boolean", spec.label)
+                        }
+                        Fault::Json(error) => error.to_string(),
+                    };
+                    return Err(rows.error_at(offset, message));
+                }
+            }
         }
+        Ok(rows)
     }
 
-    /// Row index by key, or an error naming the two lines of a duplicate.
-    fn by_key(&self) -> Result<HashMap<&str, usize>> {
-        let mut by_key = HashMap::with_capacity(self.len());
-        for (index, key) in self.keys.iter().enumerate() {
-            if let Some(first) = by_key.insert(key.as_str(), index) {
-                return Err(self.error(
-                    self.lines[index],
-                    format!("duplicate key {key} (first seen at line {})", self.lines[first]),
+    /// Row numbers sorted by key, or an error naming the lines of a duplicate.
+    fn sorted_unique(&self, spec: &KeySpec) -> Result<Vec<u32>> {
+        let mut order: Vec<u32> = (0..self.len() as u32).collect();
+        order.sort_unstable_by_key(|&row| (self.keys[row as usize], row));
+        for pair in order.windows(2) {
+            let (first, second) = (pair[0] as usize, pair[1] as usize);
+            if self.keys[first] == self.keys[second] {
+                let key = self.key_text(first, spec);
+                return Err(self.error_at(
+                    self.offsets[second],
+                    format!(
+                        "duplicate key {key} (first seen at line {})",
+                        self.line_of(self.offsets[first])
+                    ),
                 ));
             }
         }
-        Ok(by_key)
+        Ok(order)
+    }
+
+    /// The key of row `index`, as JSON, read back for a message.
+    fn key_text(&self, index: usize, spec: &KeySpec) -> String {
+        File::open(&self.path)
+            .ok()
+            .and_then(|mut file| self.read(&mut file, index).ok())
+            .and_then(|row| {
+                row.pointer(&format!("/{}", spec.tokens.join("/"))).map(Value::to_string)
+            })
+            .unwrap_or_else(|| "?".to_string())
     }
 
     /// Reads row `index` back from the file.
     fn read(&self, file: &mut File, index: usize) -> Result<Value> {
-        let (start, length) = self.spans[index];
-        let mut buffer = vec![0u8; length as usize];
+        let start = self.offsets[index];
+        let stop = self.offsets.get(index + 1).copied().unwrap_or(self.end);
+        let mut buffer = vec![0u8; (stop - start) as usize];
         file.seek(SeekFrom::Start(start))
             .and_then(|_| file.read_exact(&mut buffer))
             .map_err(|e| DriftError::Io(format!("{}: {e}", self.path.display())))?;
-        serde_json::from_slice(trim(&buffer)).map_err(|e| self.error(self.lines[index], e))
+        serde_json::from_slice(trim(&buffer)).map_err(|e| self.error_at(start, e))
     }
 }
 
-/// A 128-bit fingerprint of a value such that equal values (as `==` on
-/// `serde_json::Value`: object members in any order, `1` different from `1.0`)
-/// have equal fingerprints. Rows with equal fingerprints are treated as equal,
-/// which is wrong only for a 128-bit collision.
-fn fingerprint(value: &Value) -> u128 {
-    (u128::from(lane(value, 0x9E37_79B9_7F4A_7C15)) << 64)
-        | u128::from(lane(value, 0xC2B2_AE3D_27D4_EB4F))
-}
-
-/// One 64-bit half of the fingerprint; the two halves use different salts.
-fn lane(value: &Value, salt: u64) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    salt.hash(&mut hasher);
-    match value {
-        Value::Null => 0u8.hash(&mut hasher),
-        Value::Bool(b) => (1u8, *b).hash(&mut hasher),
-        Value::Number(n) => match (n.as_i64(), n.as_u64(), n.as_f64()) {
-            (Some(i), _, _) => (2u8, i).hash(&mut hasher),
-            (None, Some(u), _) => (3u8, u).hash(&mut hasher),
-            (None, None, Some(f)) => (4u8, f.to_bits()).hash(&mut hasher),
-            _ => 8u8.hash(&mut hasher),
-        },
-        Value::String(text) => (5u8, text).hash(&mut hasher),
-        Value::Array(items) => {
-            (6u8, items.len()).hash(&mut hasher);
-            for item in items {
-                lane(item, salt).hash(&mut hasher);
+/// Cuts a file of `len` bytes into up to `parts` stretches that each start at the
+/// beginning of a line.
+fn chunk_bounds(path: &Path, len: u64, parts: usize) -> Result<Vec<(u64, u64)>> {
+    let mut starts = vec![0u64];
+    if parts > 1 && len > 0 {
+        let mut reader = BufReader::new(open(path)?);
+        for k in 1..parts as u64 {
+            let target = (len * k / parts as u64).max(*starts.last().expect("starts is not empty"));
+            let mut skipped = Vec::new();
+            let moved = reader
+                .seek(SeekFrom::Start(target))
+                .and_then(|_| reader.read_until(b'\n', &mut skipped))
+                .map_err(|e| DriftError::Io(format!("{}: {e}", path.display())))?;
+            let start = target + moved as u64;
+            if start < len && start > *starts.last().expect("starts is not empty") {
+                starts.push(start);
             }
         }
-        Value::Object(members) => {
-            (7u8, members.len()).hash(&mut hasher);
-            // Added together so the order of the members does not matter.
-            let combined = members.iter().fold(0u64, |sum, (name, member)| {
-                let mut entry = DefaultHasher::new();
-                (salt, name, lane(member, salt)).hash(&mut entry);
-                sum.wrapping_add(entry.finish())
-            });
-            combined.hash(&mut hasher);
-        }
     }
-    hasher.finish()
+    let mut bounds: Vec<(u64, u64)> = starts.windows(2).map(|w| (w[0], w[1])).collect();
+    bounds.push((*starts.last().expect("starts is not empty"), len));
+    Ok(bounds)
+}
+
+/// Indexes the lines that start in `start..stop`.
+fn index_part(
+    path: &Path,
+    start: u64,
+    stop: u64,
+    spec: &KeySpec,
+) -> std::result::Result<Part, Failure> {
+    let io = |e: std::io::Error| Failure {
+        offset: start,
+        fault: Fault::Json(serde::de::Error::custom(format!("{}: {e}", path.display()))),
+    };
+    let mut file = File::open(path).map_err(io)?;
+    file.seek(SeekFrom::Start(start)).map_err(io)?;
+    let mut reader = BufReader::with_capacity(1 << 20, file.take(stop - start));
+    let mut part = Part { keys: Vec::new(), hashes: Vec::new(), offsets: Vec::new() };
+    let (mut buffer, mut offset) = (Vec::new(), start);
+    loop {
+        buffer.clear();
+        let read = reader.read_until(b'\n', &mut buffer).map_err(io)?;
+        if read == 0 {
+            return Ok(part);
+        }
+        let line_start = offset;
+        offset += read as u64;
+        let text = trim(&buffer);
+        if text.is_empty() {
+            continue;
+        }
+        let key = read_key(text, spec).map_err(|fault| Failure { offset: line_start, fault })?;
+        part.keys.push(hash_key(&key));
+        part.hashes.push(hash_bytes(text));
+        part.offsets.push(line_start);
+    }
+}
+
+/// Two 64-bit hashes of the same data with different salts, as one 128-bit hash.
+fn hash128(feed: impl Fn(&mut DefaultHasher)) -> u128 {
+    let lane = |salt: u64| {
+        let mut hasher = DefaultHasher::new();
+        salt.hash(&mut hasher);
+        feed(&mut hasher);
+        hasher.finish()
+    };
+    (u128::from(lane(0x9E37_79B9_7F4A_7C15)) << 64) | u128::from(lane(0xC2B2_AE3D_27D4_EB4F))
+}
+
+fn hash_bytes(bytes: &[u8]) -> u128 {
+    hash128(|hasher| bytes.hash(hasher))
+}
+
+/// A hash of a scalar key that keeps the number 1, the string "1" and the
+/// number 1.0 apart, as the in-memory diff does.
+fn hash_key(key: &Value) -> u128 {
+    hash128(|hasher| match key {
+        Value::String(text) => (0u8, text).hash(hasher),
+        Value::Bool(b) => (1u8, *b).hash(hasher),
+        Value::Number(n) => match (n.as_i64(), n.as_u64(), n.as_f64()) {
+            (Some(i), _, _) => (2u8, i).hash(hasher),
+            (None, Some(u), _) => (3u8, u).hash(hasher),
+            (None, None, Some(f)) => (4u8, f.to_bits()).hash(hasher),
+            _ => 5u8.hash(hasher),
+        },
+        _ => 6u8.hash(hasher),
+    })
 }
 
 #[cfg(test)]
@@ -560,35 +815,140 @@ mod tests {
         ));
     }
 
+    fn key(field: &str) -> KeySpec {
+        KeySpec::parse(&[field.to_string()]).unwrap()
+    }
+
     #[test]
-    fn the_fingerprint_ignores_member_order_but_nothing_else() {
-        let same = [
-            (
-                json!({"a": 1, "b": [1, 2], "c": {"x": 1, "y": 2}}),
-                json!({"c": {"y": 2, "x": 1}, "b": [1, 2], "a": 1}),
-            ),
-            (json!({}), json!({})),
-            (json!("é"), json!("\u{00e9}")),
-        ];
-        for (a, b) in same {
-            assert_eq!(fingerprint(&a), fingerprint(&b), "{a} vs {b}");
+    fn the_index_is_the_same_however_the_file_is_cut_up() {
+        // xorshift: deterministic, no extra dependencies.
+        let mut state = 0x243F6A8885A308D3u64;
+        let mut next = move |n: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % n
+        };
+        for round in 0..100 {
+            // Rows of very different lengths, blank lines, CRLF and no final newline.
+            let mut text = String::new();
+            let rows = next(60) + 1;
+            for id in 0..rows {
+                let pad = "x".repeat(next(200) as usize);
+                text.push_str(&format!("{{\"id\":{id},\"pad\":\"{pad}\"}}"));
+                text.push_str(["\n", "\r\n", "\n\n", "\n  \n\r\n"][next(4) as usize]);
+            }
+            if next(2) == 0 {
+                text = text.trim_end().to_string();
+            }
+            let dir = Dir::new();
+            let path = dir.text("rows.ndjson", &text);
+            let single = Rows::index_with(&path, &key("id"), 1).unwrap();
+            assert_eq!(single.len() as u64, rows, "round {round}");
+            for threads in 2..=8 {
+                let split = Rows::index_with(&path, &key("id"), threads).unwrap();
+                assert_eq!(split.keys, single.keys, "round {round}, {threads} threads");
+                assert_eq!(split.hashes, single.hashes, "round {round}, {threads} threads");
+                assert_eq!(split.offsets, single.offsets, "round {round}, {threads} threads");
+            }
         }
-        // Different values must not collide in these ordinary cases.
-        let different = [
-            (json!({"a": 1}), json!({"a": 2})),
-            (json!({"a": 1}), json!({"b": 1})),
-            (json!(1), json!(1.0)),
-            (json!(1), json!("1")),
-            (json!(true), json!(1)),
-            (json!(null), json!(false)),
-            (json!([1, 2]), json!([2, 1])),
-            (json!([]), json!({})),
-            (json!({"a": {"b": 1}}), json!({"a": {"b": 2}})),
-            (json!({"a": 1, "b": 2}), json!({"a": 2, "b": 1})),
-            (json!(""), json!(null)),
-        ];
-        for (a, b) in different {
-            assert_ne!(fingerprint(&a), fingerprint(&b), "{a} vs {b}");
+    }
+
+    #[test]
+    fn a_bad_row_in_any_part_of_a_split_file_is_reported_with_its_own_line() {
+        let dir = Dir::new();
+        let mut text = String::new();
+        for id in 0..200 {
+            text.push_str(&format!("{{\"id\":{id},\"pad\":\"{}\"}}\n", "x".repeat(50)));
         }
+        let lines: Vec<&str> = text.lines().collect();
+        for bad in [0usize, 1, 57, 100, 143, 198, 199] {
+            let mut broken = lines.clone();
+            broken[bad] = "{\"id\": nope}";
+            let path = dir.text("broken.ndjson", &broken.join("\n"));
+            for threads in [1, 4, 8] {
+                let error = Rows::index_with(&path, &key("id"), threads).err().unwrap().to_string();
+                assert!(
+                    error.contains(&format!("line {}:", bad + 1)),
+                    "{threads} threads, row {bad}: {error}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn reading_only_the_key_agrees_with_parsing_the_whole_row() {
+        // xorshift: deterministic, no extra dependencies.
+        let mut state = 0xB7E151628AED2A6Au64;
+        let mut next = move |n: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % n
+        };
+        fn value(depth: usize, next: &mut dyn FnMut(u64) -> u64) -> Value {
+            match if depth == 0 { next(4) } else { next(7) } {
+                0 => json!(next(5)),
+                1 => json!(["k", "id", "a b"][next(3) as usize]),
+                2 => json!(next(2) == 0),
+                3 => Value::Null,
+                4 => Value::Array((0..next(3)).map(|_| value(depth - 1, next)).collect()),
+                _ => {
+                    let mut map = serde_json::Map::new();
+                    for name in ["id", "k", "a", "user", "b"] {
+                        if next(3) != 0 {
+                            map.insert(name.to_string(), value(depth - 1, next));
+                        }
+                    }
+                    Value::Object(map)
+                }
+            }
+        }
+        for field in ["id", "/user/id", "/a/b/k"] {
+            let spec = key(field);
+            let pointer =
+                if field.starts_with('/') { field.to_string() } else { format!("/{field}") };
+            for round in 0..400 {
+                let row = value(3, &mut next);
+                let line = row.to_string();
+                let expected = match &row {
+                    Value::Object(_) => match row.pointer(&pointer) {
+                        None => "no key".to_string(),
+                        Some(v @ (Value::String(_) | Value::Number(_) | Value::Bool(_))) => {
+                            format!("key {v}")
+                        }
+                        Some(_) => "bad key".to_string(),
+                    },
+                    _ => "not an object".to_string(),
+                };
+                let got = match read_key(line.as_bytes(), &spec) {
+                    Ok(v) => format!("key {v}"),
+                    Err(Fault::NoKey) => "no key".to_string(),
+                    Err(Fault::BadKey) => "bad key".to_string(),
+                    Err(Fault::NotObject) => "not an object".to_string(),
+                    Err(Fault::Json(e)) => panic!("{field} round {round}: {e}: {line}"),
+                };
+                assert_eq!(got, expected, "{field} round {round}: {line}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_key_given_as_a_json_pointer_reaches_into_the_row() {
+        let old = [json!({"user": {"id": 1}, "v": 1}), json!({"user": {"id": 2}, "v": 2})];
+        let new = [json!({"user": {"id": 2}, "v": 5}), json!({"user": {"id": 1}, "v": 1})];
+        let dir = Dir::new();
+        let ops = diff_records(
+            &dir.rows("o.ndjson", &old),
+            &dir.rows("n.ndjson", &new),
+            "/user/id",
+            &DiffOptions::new(),
+        )
+        .unwrap();
+        // Row 2 moves to the front and changes; row 1 stays as it was.
+        assert_eq!(
+            ops.iter().map(|o| (o.op.as_str(), o.path.as_str())).collect::<Vec<_>>(),
+            [("move", "/0"), ("replace", "/0/v")]
+        );
     }
 }
