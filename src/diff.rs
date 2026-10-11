@@ -248,6 +248,12 @@ pub(crate) fn walk(new: &Value, old: &Value, path: &str, ctx: &Context, output: 
     if ctx.ignored(path) {
         return;
     }
+    // Equal values produce no operations, however they are ignored or matched
+    // inside. Checking first saves building a path for every field of every
+    // unchanged row, which dominated the diff of a large array.
+    if new == old {
+        return;
+    }
     match (new, old) {
         (Value::Object(new_obj), Value::Object(old_obj)) => {
             let old_keys: BTreeSet<_> = old_obj.keys().collect();
