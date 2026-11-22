@@ -233,3 +233,91 @@ fn version_flag() {
     assert_eq!(out.status.code(), Some(0));
     assert!(stdout(&out).contains(env!("CARGO_PKG_VERSION")));
 }
+
+fn merge_inputs(dir: &TempDir) -> (String, String, String) {
+    (
+        write(dir, "base.json", r#"{"a":1,"b":1}"#),
+        write(dir, "ours.json", r#"{"a":2,"b":1}"#),
+        write(dir, "theirs.json", r#"{"a":1,"b":3}"#),
+    )
+}
+
+fn conflicting_inputs(dir: &TempDir) -> (String, String, String) {
+    (
+        write(dir, "base.json", r#"{"a":1}"#),
+        write(dir, "ours.json", r#"{"a":2}"#),
+        write(dir, "theirs.json", r#"{"a":3}"#),
+    )
+}
+
+#[test]
+fn merge_clean_prints_document_exit_zero() {
+    let dir = TempDir::new().unwrap();
+    let (b, o, t) = merge_inputs(&dir);
+    let out = drift(&["merge", &b, &o, &t]);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(json(&out), serde_json::json!({"a":2,"b":3}));
+}
+
+#[test]
+fn merge_conflict_exits_one_with_report() {
+    let dir = TempDir::new().unwrap();
+    let (b, o, t) = conflicting_inputs(&dir);
+    let dest = dir.path().join("out.json");
+    let out = drift(&["merge", &b, &o, &t, "-o", dest.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        json(&out),
+        serde_json::json!({"conflicts":[{"path":"/a","base":1,"ours":2,"theirs":3}]})
+    );
+    assert!(!dest.exists());
+}
+
+#[test]
+fn merge_prefer_theirs_resolves() {
+    let dir = TempDir::new().unwrap();
+    let (b, o, t) = conflicting_inputs(&dir);
+    let out = drift(&["merge", &b, &o, &t, "--prefer", "theirs"]);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(json(&out)["a"], 3);
+}
+
+#[test]
+fn merge_keeps_yaml_comments() {
+    let dir = TempDir::new().unwrap();
+    let b = write(&dir, "base.yaml", "# top\na: 1 # one\nb: 1\n");
+    let o = write(&dir, "ours.yaml", "a: 2\nb: 1\n");
+    let t = write(&dir, "theirs.yaml", "a: 1\nb: 2\n");
+    let out = drift(&["merge", &b, &o, &t]);
+    assert_eq!(out.status.code(), Some(0));
+    let text = stdout(&out);
+    assert!(text.contains("# top"), "{text}");
+    assert!(text.contains("# one"), "{text}");
+    assert!(text.contains("a: 2"), "{text}");
+    assert!(text.contains("b: 2"), "{text}");
+}
+
+#[test]
+fn merge_array_key_merges_arrays() {
+    let dir = TempDir::new().unwrap();
+    let b = write(&dir, "base.json", r#"{"l":[{"id":1,"v":0}]}"#);
+    let o = write(&dir, "ours.json", r#"{"l":[{"id":1,"v":0},{"id":2,"v":2}]}"#);
+    let t = write(&dir, "theirs.json", r#"{"l":[{"id":1,"v":0},{"id":3,"v":3}]}"#);
+    let out = drift(&["merge", &b, &o, &t, "--array-key", "id"]);
+    assert_eq!(out.status.code(), Some(0));
+    let items = json(&out)["l"].as_array().unwrap().clone();
+    assert_eq!(items.len(), 3);
+    let out = drift(&["merge", &b, &o, &t]);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(json(&out)["conflicts"][0]["path"], "/l");
+}
+
+#[test]
+fn merge_missing_file_is_an_error() {
+    let dir = TempDir::new().unwrap();
+    let (b, o, _) = merge_inputs(&dir);
+    let out = drift(&["merge", &b, &o, "/nonexistent/theirs.json"]);
+    assert_ne!(out.status.code(), Some(0));
+    assert!(!out.stderr.is_empty());
+    assert!(!stdout(&out).contains("conflicts"));
+}

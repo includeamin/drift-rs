@@ -3,8 +3,8 @@ pub mod formats;
 use self::formats::{load, read, resolve, Format};
 use clap::{Args, Parser, Subcommand};
 use drift::{
-    compose, diff, diff_files, diff_with, filter_operations, invert, patch, Delta, DiffOptions,
-    Operation, VERSION,
+    compose, diff, diff_files, diff_with, filter_operations, invert, merge_with, patch, Delta,
+    DiffOptions, MergeOptions, Merged, Operation, Side, VERSION,
 };
 use serde_json::Value;
 use std::{
@@ -27,6 +27,7 @@ enum Command {
     Check(CheckArgs),
     Invert(InvertArgs),
     Compose(ComposeArgs),
+    Merge(MergeArgs),
 }
 #[derive(Args)]
 struct OutputArgs {
@@ -101,6 +102,31 @@ struct DiffArgs {
     temp_dir: Option<String>,
     #[command(flatten)]
     output: OutputArgs,
+}
+/// Three-way merge of two edited versions of a base document
+#[derive(Args)]
+struct MergeArgs {
+    base: String,
+    ours: String,
+    theirs: String,
+    /// Field that identifies array items (repeatable, tried in order)
+    #[arg(long = "array-key")]
+    array_keys: Vec<String>,
+    /// Resolve every conflict in favour of one side
+    #[arg(long, value_enum)]
+    prefer: Option<PreferArg>,
+    #[arg(long, value_enum)]
+    format: Option<Format>,
+    /// XML: always read child elements as arrays, even a single one
+    #[arg(long)]
+    xml_arrays: bool,
+    #[command(flatten)]
+    output: OutputArgs,
+}
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum PreferArg {
+    Ours,
+    Theirs,
 }
 #[derive(Args)]
 struct PatchArgs {
@@ -666,6 +692,41 @@ fn cmd_patch(args: PatchArgs) -> Result<i32, Box<dyn std::error::Error>> {
     Ok(0)
 }
 
+fn cmd_merge(args: MergeArgs) -> Result<i32, Box<dyn std::error::Error>> {
+    let format = resolve(args.format, &args.base);
+    let base_text = read(&args.base)?;
+    let options = drift::formats::ParseOptions { xml_arrays: args.xml_arrays };
+    let (base, _) = drift::formats::parse_with(&base_text, format, &options)?;
+    let (ours, _) = drift::formats::parse_with(&read(&args.ours)?, format, &options)?;
+    let (theirs, _) = drift::formats::parse_with(&read(&args.theirs)?, format, &options)?;
+    let mut merge_options = MergeOptions::new();
+    for key in args.array_keys {
+        merge_options = merge_options.array_key(key);
+    }
+    match args.prefer {
+        Some(PreferArg::Ours) => merge_options = merge_options.prefer(Side::Ours),
+        Some(PreferArg::Theirs) => merge_options = merge_options.prefer(Side::Theirs),
+        None => {}
+    }
+    match merge_with(&base, &ours, &theirs, &merge_options) {
+        Merged::Clean(value) => {
+            let text = drift::formats::dump_like(&base_text, &value, format, args.output.compact)?;
+            write_output(text, &args.output.output)?;
+            Ok(0)
+        }
+        Merged::Conflicted(conflicts) => {
+            let report = serde_json::json!({ "conflicts": conflicts });
+            let text = if args.output.compact {
+                serde_json::to_string(&report)?
+            } else {
+                serde_json::to_string_pretty(&report)?
+            };
+            write_output(text, &None)?;
+            Ok(1)
+        }
+    }
+}
+
 fn cmd_paths(args: PathsArgs) -> Result<i32, Box<dyn std::error::Error>> {
     let document = load(&args.document, resolve(args.format, &args.document), args.xml_arrays)?.0;
     let paths = drift::list_json_paths(
@@ -728,6 +789,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         Command::Check(args) => cmd_check(args)?,
         Command::Invert(args) => cmd_invert(args)?,
         Command::Compose(args) => cmd_compose(args)?,
+        Command::Merge(args) => cmd_merge(args)?,
     };
     std::process::exit(code)
 }
