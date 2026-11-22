@@ -423,6 +423,22 @@ mod tests {
     }
 
     #[test]
+    fn nested_conflict_reports_full_path() {
+        let b = json!({"a": {"b": {"c": 1, "d": 1}}, "e": 1});
+        let o = json!({"a": {"b": {"c": 2, "d": 5}}, "e": 1});
+        let t = json!({"a": {"b": {"c": 3, "d": 1}}, "e": 4});
+        assert_eq!(
+            merge(&b, &o, &t),
+            Merged::Conflicted(vec![conflict(
+                "/a/b/c",
+                Some(json!(1)),
+                Some(json!(2)),
+                Some(json!(3))
+            )])
+        );
+    }
+
+    #[test]
     fn pointer_escaping() {
         let m = merge(&json!({"a/b~": 1}), &json!({"a/b~": 2}), &json!({"a/b~": 3}));
         let Merged::Conflicted(c) = m else { panic!("clean") };
