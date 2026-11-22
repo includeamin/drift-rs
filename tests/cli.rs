@@ -335,3 +335,60 @@ fn merge_rejects_stdin_used_twice() {
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(json(&out), serde_json::json!({"a":2,"b":1}));
 }
+
+#[test]
+fn merge_compact_prints_one_line() {
+    let dir = TempDir::new().unwrap();
+    let (b, o, t) = conflicting_inputs(&dir);
+    let out = drift(&["merge", &b, &o, &t, "--compact"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        stdout(&out).trim_end(),
+        r#"{"conflicts":[{"path":"/a","base":1,"ours":2,"theirs":3}]}"#
+    );
+    let (b, o, t) = merge_inputs(&dir);
+    let out = drift(&["merge", &b, &o, &t, "--compact"]);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(stdout(&out).trim_end(), r#"{"a":2,"b":3}"#);
+}
+
+#[test]
+fn merge_clean_writes_output_file() {
+    let dir = TempDir::new().unwrap();
+    let (b, o, t) = merge_inputs(&dir);
+    let dest = dir.path().join("out.json");
+    let out = drift(&["merge", &b, &o, &t, "-o", dest.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(0));
+    assert!(stdout(&out).is_empty());
+    let written: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&dest).unwrap()).unwrap();
+    assert_eq!(written, serde_json::json!({"a":2,"b":3}));
+}
+
+#[test]
+fn merge_keeps_toml_layout() {
+    let dir = TempDir::new().unwrap();
+    let b = write(&dir, "base.toml", "# settings\n[server]\nport = 80 # http\nhost = \"a\"\n");
+    let o = write(&dir, "ours.toml", "[server]\nport = 8080\nhost = \"a\"\n");
+    let t = write(&dir, "theirs.toml", "[server]\nport = 80\nhost = \"b\"\n");
+    let out = drift(&["merge", &b, &o, &t]);
+    assert_eq!(out.status.code(), Some(0));
+    let text = stdout(&out);
+    assert!(text.contains("# settings"), "{text}");
+    assert!(text.contains("[server]"), "{text}");
+    assert!(text.contains("port = 8080"), "{text}");
+    assert!(text.contains("host = \"b\""), "{text}");
+}
+
+#[test]
+fn merge_xml_documents() {
+    let dir = TempDir::new().unwrap();
+    let b = write(&dir, "base.xml", "<r><a>1</a><b>1</b></r>");
+    let o = write(&dir, "ours.xml", "<r><a>2</a><b>1</b></r>");
+    let t = write(&dir, "theirs.xml", "<r><a>1</a><b>3</b></r>");
+    let out = drift(&["merge", &b, &o, &t]);
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    let text = stdout(&out);
+    assert!(text.contains("<a>2</a>"), "{text}");
+    assert!(text.contains("<b>3</b>"), "{text}");
+}
