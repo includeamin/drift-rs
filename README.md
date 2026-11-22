@@ -138,9 +138,12 @@ between that document and the patched one.
 `drift merge BASE OURS THEIRS` combines two edited versions of a document that
 both started from `BASE`. At every node, a side that did not change it takes
 the other side's version, and when both sides made the same change it is kept
-once. Objects are merged key by key and arrays item by item, so two edits to
-different places never conflict. Only when both sides changed the same place
-differently, or one deleted what the other modified, is there a conflict.
+once. Objects are merged key by key, so edits to different keys never
+conflict. Arrays are merged item by item only with `--array-key` (below);
+without it an array is never merged by position, so if both sides changed one
+array differently, even in different places, the whole array is a conflict.
+Otherwise there is a conflict only when both sides changed the same place
+differently, or one deleted what the other modified.
 
 ```bash
 drift merge base.yaml ours.yaml theirs.yaml -o merged.yaml
@@ -164,21 +167,28 @@ conflict goes to stdout and the exit code is 1.
 ```
 
 `base`, `ours` and `theirs` hold the values at `path`; one is left out when the
-key or item is absent on that side. `--prefer ours` or `--prefer theirs`
-resolves every conflict in favour of that side instead, including a deletion
-that conflicts with a modification, and exits 0.
+key or item is absent on that side. Inside an array merged with `--array-key`,
+the index in `path` is the item's index in `BASE` (or, for an item that is not
+in `BASE`, in ours, else in theirs), so it may not point at the item in ours or
+theirs. `--prefer ours` or `--prefer theirs` resolves every conflict in favour
+of that side instead, including a deletion that conflicts with a modification,
+and exits 0. A conflict on a whole array (such as both sides reordering it
+differently) is resolved by taking the preferred side's whole array, which
+drops the other side's edits to items of that array even where they did not
+conflict.
 
-Arrays are merged by position unless `--array-key` (repeatable, as for `diff`)
-names a field that identifies the items. With a key, items are matched by it,
-each side's edits, additions and removals are applied, and an item added with no
-item before it goes at the front of the array. Additions at the same position
-from both sides are ordered by the identity of each side's first added item, so
-the result does not depend on which side is "ours". If only one side reordered
-the items, its order is kept; if both reordered them differently, the array is
-a conflict as a whole. An item both sides added must sit on the same side of
-every item both sides have, in both versions; otherwise the sides disagree on
-where it goes and the whole array is a conflict. Without a usable key, an
-array that both sides changed differently is a conflict as a whole.
+`--array-key` (repeatable, as for `diff`) names a field that identifies array
+items. With a key, items are matched by it, each side's edits, additions and
+removals are applied, and an item added with no item before it goes at the
+front of the array. Additions at the same position from both sides are ordered
+by the identity of each side's first added item, so the result does not depend
+on which side is "ours". If only one side reordered the items, its order is
+kept; if both reordered them differently, the array is a conflict as a whole.
+An item both sides added must sit on the same side of every item both sides
+have, in both versions; otherwise the sides disagree on where it goes and the
+whole array is a conflict. Without a usable key, an array that both sides
+changed differently is a conflict as a whole: with base `{"l": [1, 2]}`, ours
+`[9, 2]` and theirs `[1, 9]` conflict at `/l`.
 
 ```bash
 drift merge --array-key id base.json ours.json theirs.json
@@ -187,9 +197,21 @@ drift merge --array-key id base.json ours.json theirs.json
 YAML and TOML comments and layout are kept, taken from `BASE`, as for
 `drift patch`.
 
-Not supported: `--ignore-path`, record files (NDJSON, CSV, TSV) and streaming.
-All three documents are loaded into memory. In Rust the same merge is
-`drift::merge` and `drift::merge_with`.
+NDJSON, CSV and TSV files are not merged as records: `merge` reads each as one
+ordinary document. All three documents are loaded into memory. In Rust the same
+merge is `drift::merge` and `drift::merge_with`.
+
+Not supported yet:
+
+- `--ignore-path` and streaming.
+- Two different arrays that both sides added at the same key (absent from
+  `BASE`) are a conflict as a whole, even with `--array-key`.
+- The format is detected from `BASE`'s path only; use `--format` when `BASE`
+  has no telling extension, such as when it is `-`.
+- Conflicts and errors both exit 1; tell them apart by the JSON report on
+  stdout (errors go to stderr).
+- From the Rust API, very deeply nested documents can overflow the stack (the
+  CLI rejects documents nested more than 128 levels).
 
 ### Cargo features
 

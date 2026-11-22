@@ -21,6 +21,10 @@ pub enum Merged {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Conflict {
     /// JSON Pointer to the conflicting node (empty for the document root).
+    ///
+    /// Inside an array merged by key, the index is the item's index in the
+    /// base (for an item not in the base, its index in ours, else in theirs),
+    /// so it may not point at the item in ours or theirs.
     pub path: String,
     /// The value in the common base.
     #[serde(skip_serializing_if = "Option::is_none")]
