@@ -144,7 +144,7 @@ All are on by default. A library user who only needs JSON can drop the rest,
 which also drops `serde_yaml`, `toml`, `roxmltree` and `clap` from the build:
 
 ```toml
-drift = { version = "0.15", default-features = false }
+drift = { version = "0.25", default-features = false }
 ```
 
 Using a format whose feature is off returns an error naming the feature to
