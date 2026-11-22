@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.26.0] - 2026-11-22
+- test: cover merge --compact, -o, TOML, XML and nested conflicts
+- docs: correct and extend the merge documentation
+- fix(cli): reject merge inputs that read stdin more than once
+- fix(merge): conflict when both sides add an id at different places
+- docs: document drift merge
+- feat: add drift merge command
+- test: add property tests for three-way merge
+- fix: keep the preferred side's item in keyed merges
+- feat: merge arrays matched by key
+- feat: add three-way merge for objects and values
+- docs: design and plan for three-way merge
+- test: add CLI end-to-end tests and round-trip property tests
+- fix(ci): build the changelog from commits since the last tag
+
+
 ## [0.25.0] - 2026-10-17
 - Release 0.25.0
 
