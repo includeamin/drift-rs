@@ -72,6 +72,27 @@ impl MergeOptions {
 }
 
 /// Merge `ours` and `theirs`, which both descend from `base`.
+///
+/// ```
+/// use drift::{merge, Merged};
+/// use serde_json::json;
+///
+/// let base = json!({"port": 80, "debug": false});
+///
+/// // Different keys changed: both edits are kept.
+/// let clean = merge(&base, &json!({"port": 8080, "debug": false}), &json!({"port": 80, "debug": true}));
+/// assert_eq!(clean, Merged::Clean(json!({"port": 8080, "debug": true})));
+///
+/// // The same key changed differently: a conflict.
+/// let conflicted = merge(&base, &json!({"port": 8080, "debug": false}), &json!({"port": 9090, "debug": false}));
+/// match conflicted {
+///     Merged::Conflicted(conflicts) => {
+///         assert_eq!(conflicts.len(), 1);
+///         assert_eq!(conflicts[0].path, "/port");
+///     }
+///     Merged::Clean(_) => unreachable!(),
+/// }
+/// ```
 pub fn merge(base: &Value, ours: &Value, theirs: &Value) -> Merged {
     merge_with(base, ours, theirs, &MergeOptions::default())
 }
