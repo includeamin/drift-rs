@@ -72,6 +72,7 @@ drift paths DOCUMENT
 drift check OLD NEW
 drift invert DOCUMENT PATCH
 drift compose DOCUMENT PATCH...
+drift merge BASE OURS THEIRS
 ```
 
 JSON, YAML, TOML, and XML documents are supported. The format is detected from
@@ -79,7 +80,8 @@ the file extension or selected with `--format`. Use `-` for stdin and
 `-o/--output` for a file destination.
 
 `diff` supports `--stats`, `--pretty`, `--exit-code`, `--path`, `--field`,
-`--grep`, `--op`, and `--invert-match`. `paths` supports `--values`,
+`--grep`, `--op`, and `--invert-match`. `merge` supports `--array-key`,
+`--prefer`, and `--format`. `paths` supports `--values`,
 `--containers`, `--include-root`, `--sort-keys`, `--max-depth`, and `--json`.
 
 `invert` prints the patch that undoes `PATCH` when it is applied to `DOCUMENT`,
@@ -130,6 +132,60 @@ cleanly. Undoing a removal puts an object member back as a new key, so the
 restored document is equal to the original but the member can sit last instead
 of where it was. `compose` needs the same base document: it is the difference
 between that document and the patched one.
+
+### Merging
+
+`drift merge BASE OURS THEIRS` combines two edited versions of a document that
+both started from `BASE`. At every node, a side that did not change it takes
+the other side's version, and when both sides made the same change it is kept
+once. Objects are merged key by key and arrays item by item, so two edits to
+different places never conflict. Only when both sides changed the same place
+differently, or one deleted what the other modified, is there a conflict.
+
+```bash
+drift merge base.yaml ours.yaml theirs.yaml -o merged.yaml
+```
+
+With no conflicts the merged document is printed (or written with `-o`) and the
+exit code is 0. With conflicts nothing is merged: a JSON report of every
+conflict goes to stdout and the exit code is 1.
+
+```json
+{
+  "conflicts": [
+    {
+      "path": "/port",
+      "base": 80,
+      "ours": 8080,
+      "theirs": 9090
+    }
+  ]
+}
+```
+
+`base`, `ours` and `theirs` hold the values at `path`; one is left out when the
+key or item is absent on that side. `--prefer ours` or `--prefer theirs`
+resolves every conflict in favour of that side instead, including a deletion
+that conflicts with a modification, and exits 0.
+
+Arrays are merged by position unless `--array-key` (repeatable, as for `diff`)
+names a field that identifies the items. With a key, items are matched by it,
+each side's edits, additions and removals are applied, and an item added with no
+item before it goes at the front of the array. Additions at the same position
+from both sides are ordered by the identity of each side's first added item, so
+the result does not depend on which side is "ours". Without a usable key, an
+array that both sides changed differently is a conflict as a whole.
+
+```bash
+drift merge --array-key id base.json ours.json theirs.json
+```
+
+YAML and TOML comments and layout are kept, taken from `BASE`, as for
+`drift patch`.
+
+Not supported: `--ignore-path`, record files (NDJSON, CSV, TSV) and streaming.
+All three documents are loaded into memory. In Rust the same merge is
+`drift::merge` and `drift::merge_with`.
 
 ### Cargo features
 

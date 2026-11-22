@@ -78,7 +78,8 @@ unique string, number or boolean value). Items are merged by key with the node
 rule above. Order: if only one side reordered the items common to base, use
 that side's order; if both reordered them differently, conflict on the array;
 items added by one side go after their predecessor in that side's array, else
-at the end. Arrays without a usable key are merged only by the equal-or-
+at the front; additions at the same position from both sides are ordered by the
+identity string of each side's first added item. Arrays without a usable key are merged only by the equal-or-
 unchanged rows above; otherwise a conflict on the whole array. This is a call,
 not a request: it avoids the index-shifting problem and tells users to supply a
 key.
