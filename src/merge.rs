@@ -226,15 +226,17 @@ fn keyed_array(
     };
     let skeleton: Vec<&String> = skeleton_ids.iter().filter(|i| merged.contains_key(i)).collect();
 
-    // Items only the other side added, grouped under their nearest preceding
-    // item of that side which is kept (None: the front).
+    // Items the other side contributes that the skeleton lacks (its additions,
+    // or an item the skeleton side deleted but `prefer` kept), grouped under
+    // their nearest preceding kept item of that side. With no preceding item
+    // they go at the FRONT.
     let skeleton_set: HashSet<&&String> = skeleton.iter().collect();
     let mut runs: HashMap<Option<&String>, Vec<&String>> = HashMap::new();
     let mut anchor: Option<&String> = None;
     for id in other_ids {
         if skeleton_set.contains(&id) {
             anchor = Some(id);
-        } else if !b_set.contains(id) && merged.contains_key(id) {
+        } else if merged.contains_key(id) {
             runs.entry(anchor).or_default().push(id);
         }
     }
@@ -541,5 +543,54 @@ mod tests {
                 Some(items(&[0, 1, 2]))
             )])
         );
+    }
+
+    fn val_items(vals: &[(i64, i64)]) -> Value {
+        doc(Value::Array(vals.iter().map(|(i, v)| json!({"id": i, "v": v})).collect()))
+    }
+
+    #[test]
+    fn keyed_prefer_theirs_keeps_modified_item_ours_deleted() {
+        let b = val_items(&[(1, 0), (2, 0)]);
+        let o = val_items(&[(1, 0)]);
+        let t = val_items(&[(1, 0), (2, 9)]);
+        let p = keyed().prefer(Side::Theirs);
+        assert_eq!(merge_with(&b, &o, &t, &p), Merged::Clean(val_items(&[(1, 0), (2, 9)])));
+    }
+
+    #[test]
+    fn keyed_prefer_ours_keeps_modified_item_theirs_deleted() {
+        let b = val_items(&[(1, 0), (2, 0)]);
+        let o = val_items(&[(1, 0), (2, 9)]);
+        let t = val_items(&[(1, 0)]);
+        let p = keyed().prefer(Side::Ours);
+        assert_eq!(merge_with(&b, &o, &t, &p), Merged::Clean(val_items(&[(1, 0), (2, 9)])));
+    }
+
+    #[test]
+    fn keyed_prefer_ours_removes_item_ours_deleted() {
+        let b = val_items(&[(1, 0), (2, 0)]);
+        let o = val_items(&[(1, 0)]);
+        let t = val_items(&[(1, 0), (2, 9)]);
+        let p = keyed().prefer(Side::Ours);
+        assert_eq!(merge_with(&b, &o, &t, &p), Merged::Clean(val_items(&[(1, 0)])));
+    }
+
+    #[test]
+    fn keyed_additions_interleave_with_a_reorder() {
+        let b = doc(items(&[1, 2, 3]));
+        let o = doc(items(&[3, 2, 1]));
+        let t = doc(items(&[1, 2, 9, 3]));
+        assert_eq!(ids_of(&merge_with(&b, &o, &t, &keyed())), [3, 2, 9, 1]);
+        assert_eq!(ids_of(&merge_with(&b, &t, &o, &keyed())), [3, 2, 9, 1]);
+    }
+
+    #[test]
+    fn keyed_anchor_deleted_by_other_side() {
+        let b = doc(items(&[1, 2, 3]));
+        let o = doc(items(&[1, 3]));
+        let t = doc(items(&[1, 2, 5, 3]));
+        assert_eq!(ids_of(&merge_with(&b, &o, &t, &keyed())), [1, 5, 3]);
+        assert_eq!(ids_of(&merge_with(&b, &t, &o, &keyed())), [1, 5, 3]);
     }
 }
