@@ -204,9 +204,24 @@ fn keyed_array(
     let shared = |list: &[String], other: &HashSet<&String>| -> Vec<String> {
         list.iter().filter(|i| other.contains(i)).cloned().collect()
     };
+    let position = |ids: &[String]| -> HashMap<String, usize> {
+        ids.iter().cloned().enumerate().map(|(i, id)| (id, i)).collect()
+    };
+    let (b_pos, o_pos, t_pos) = (position(&b_ids), position(&o_ids), position(&t_ids));
+
+    // The whole array conflicts when the sides disagree on where items go:
+    // - both reordered the base items, and differently; or
+    // - an id both sides added (absent from base) sits before some item both
+    //   sides have on one side and after it on the other. Only a reorder of
+    //   base items by a single side may explain a difference in order, so the
+    //   result never depends on which side is ours.
     let o_reordered = shared(&o_ids, &b_set) != shared(&b_ids, &o_set);
     let t_reordered = shared(&t_ids, &b_set) != shared(&b_ids, &t_set);
-    if o_reordered && t_reordered && shared(&o_ids, &t_set) != shared(&t_ids, &o_set) {
+    let common = shared(&o_ids, &t_set);
+    let added_apart = common.iter().filter(|id| !b_set.contains(id)).any(|added| {
+        common.iter().any(|other| (o_pos[added] < o_pos[other]) != (t_pos[added] < t_pos[other]))
+    });
+    if added_apart || (o_reordered && t_reordered && common != shared(&t_ids, &o_set)) {
         return conflict(
             Some(&Value::Array(base.to_vec())),
             Some(&Value::Array(ours.to_vec())),
@@ -217,10 +232,6 @@ fn keyed_array(
     }
 
     // Merge every item present anywhere: base order, then new in ours, then theirs.
-    let position = |ids: &[String]| -> HashMap<String, usize> {
-        ids.iter().cloned().enumerate().map(|(i, id)| (id, i)).collect()
-    };
-    let (b_pos, o_pos, t_pos) = (position(&b_ids), position(&o_ids), position(&t_ids));
     let all = b_ids
         .iter()
         .chain(o_ids.iter().filter(|i| !b_set.contains(i)))
@@ -604,6 +615,42 @@ mod tests {
         let t = doc(items(&[1, 2, 9, 3]));
         assert_eq!(ids_of(&merge_with(&b, &o, &t, &keyed())), [3, 2, 9, 1]);
         assert_eq!(ids_of(&merge_with(&b, &t, &o, &keyed())), [3, 2, 9, 1]);
+    }
+
+    #[test]
+    fn keyed_same_id_added_at_different_places_conflicts() {
+        let cases = [
+            (items(&[1, 2]), items(&[1, 2, 3]), items(&[3, 1, 2])),
+            (items(&[]), items(&[1, 2]), items(&[2, 1])),
+        ];
+        for (b, o, t) in cases {
+            let (b, o, t) = (doc(b), doc(o), doc(t));
+            for (x, y) in [(&o, &t), (&t, &o)] {
+                let m = merge_with(&b, x, y, &keyed());
+                let Merged::Conflicted(c) = &m else { panic!("clean: {m:?}") };
+                assert_eq!(c.len(), 1);
+                assert_eq!(c[0].path, "/items");
+            }
+            let ours = merge_with(&b, &o, &t, &keyed().prefer(Side::Ours));
+            let theirs = merge_with(&b, &t, &o, &keyed().prefer(Side::Theirs));
+            assert_eq!(ours, theirs);
+            assert_eq!(ours, Merged::Clean(o.clone()));
+        }
+    }
+
+    #[test]
+    fn keyed_same_id_added_at_same_place_is_clean() {
+        let b = doc(items(&[1, 2]));
+        let o = doc(items(&[1, 3, 2, 4]));
+        let t = doc(items(&[1, 3, 2]));
+        assert_eq!(ids_of(&merge_with(&b, &o, &t, &keyed())), [1, 3, 2, 4]);
+        assert_eq!(ids_of(&merge_with(&b, &t, &o, &keyed())), [1, 3, 2, 4]);
+        // One side's reorder of base items is not a disagreement about the
+        // added item when it stays on the same side of every shared item.
+        let o = doc(items(&[2, 1, 3]));
+        let t = doc(items(&[1, 2, 3]));
+        assert_eq!(ids_of(&merge_with(&b, &o, &t, &keyed())), [2, 1, 3]);
+        assert_eq!(ids_of(&merge_with(&b, &t, &o, &keyed())), [2, 1, 3]);
     }
 
     #[test]

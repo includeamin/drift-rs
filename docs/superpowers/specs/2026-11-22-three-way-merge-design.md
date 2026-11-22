@@ -76,8 +76,13 @@ Applies when `--array-key` (any listed key) is usable on base, ours and theirs,
 using the existing rule from `match_array_items` (every item an object with a
 unique string, number or boolean value). Items are merged by key with the node
 rule above. Order: if only one side reordered the items common to base, use
-that side's order; if both reordered them differently, conflict on the array;
-items added by one side go after their predecessor in that side's array, else
+that side's order; if both reordered them differently, conflict on the array.
+An id both sides added (absent from base) must sit on the same side of every
+item both sides have, in ours and in theirs; otherwise the sides disagree on
+where it goes and the whole array conflicts. Only a single side's reorder of
+base items may explain a difference in order, so the result does not depend on
+which side is ours (and `--prefer ours` equals `--prefer theirs` with the sides
+swapped). Items added by one side go after their predecessor in that side's array, else
 at the front; additions at the same position from both sides are ordered by the
 identity string of each side's first added item. Arrays without a usable key are merged only by the equal-or-
 unchanged rows above; otherwise a conflict on the whole array. This is a call,
@@ -129,6 +134,10 @@ drift merge BASE OURS THEIRS [--array-key K]... [--prefer ours|theirs]
 - Property tests in `tests/`: `merge(b, x, b) == x`, `merge(b, b, x) == x`,
   `merge(b, x, x) == x`, clean results commute, and for documents where the two
   edits touch disjoint top-level keys the result equals applying both diffs.
+  Sides derived from base by a few edits (keyed: dropped, modified, shuffled
+  items and new ids from a pool both sides share) so most merges are clean:
+  clean iff clean with the sides swapped, equal clean results, and
+  `prefer` symmetry.
 - CLI tests: clean merge, conflict exit code and JSON, `--prefer`, `-o`,
   YAML comments preserved after a clean merge.
 

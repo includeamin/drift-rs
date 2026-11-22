@@ -173,7 +173,11 @@ names a field that identifies the items. With a key, items are matched by it,
 each side's edits, additions and removals are applied, and an item added with no
 item before it goes at the front of the array. Additions at the same position
 from both sides are ordered by the identity of each side's first added item, so
-the result does not depend on which side is "ours". Without a usable key, an
+the result does not depend on which side is "ours". If only one side reordered
+the items, its order is kept; if both reordered them differently, the array is
+a conflict as a whole. An item both sides added must sit on the same side of
+every item both sides have, in both versions; otherwise the sides disagree on
+where it goes and the whole array is a conflict. Without a usable key, an
 array that both sides changed differently is a conflict as a whole.
 
 ```bash
