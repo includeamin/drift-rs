@@ -115,15 +115,20 @@ jobs:
           set -euo pipefail
           new_version="${{ needs.check-release.outputs.new_version }}"
           
-          # Create changelog entry
+          # Commits since the previous release tag, newest tag excluded from the range.
+          last_tag=$(git describe --tags --abbrev=0 --match "v*" 2>/dev/null || echo "")
+          if [ -n "$last_tag" ]; then range="${last_tag}..HEAD"; else range="HEAD"; fi
+          entries=$(git log --no-merges --pretty=format:"- %s" "$range" | grep -v "^- chore(release)" || true)
+          [ -n "$entries" ] || entries="- Release $new_version"
+
           {
             echo "# Changelog"
             echo ""
             echo "## [$new_version] - $(date +%Y-%m-%d)"
-            git log --pretty=format:"- %s" v0.0.0..HEAD 2>/dev/null | sort -u || echo "- Release $new_version"
+            echo "$entries"
             echo ""
           } > CHANGELOG.md.tmp
-          
+
           if [ -f CHANGELOG.md ]; then
             tail -n +2 CHANGELOG.md >> CHANGELOG.md.tmp 2>/dev/null || true
           fi
