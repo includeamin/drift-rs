@@ -321,3 +321,17 @@ fn merge_missing_file_is_an_error() {
     assert!(!out.stderr.is_empty());
     assert!(!stdout(&out).contains("conflicts"));
 }
+
+#[test]
+fn merge_rejects_stdin_used_twice() {
+    let dir = TempDir::new().unwrap();
+    let (_, o, _) = merge_inputs(&dir);
+    let out = drift_stdin(&["merge", "-", &o, "-", "--format", "yaml"], r#"{"a":1,"b":1}"#);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(stdout(&out).is_empty(), "{}", stdout(&out));
+    let err = String::from_utf8(out.stderr).unwrap();
+    assert!(err.contains("stdin can be used only once"), "{err}");
+    let out = drift_stdin(&["merge", "-", &o, &o, "--format", "json"], r#"{"a":1,"b":1}"#);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(json(&out), serde_json::json!({"a":2,"b":1}));
+}

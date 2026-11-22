@@ -693,6 +693,12 @@ fn cmd_patch(args: PatchArgs) -> Result<i32, Box<dyn std::error::Error>> {
 }
 
 fn cmd_merge(args: MergeArgs) -> Result<i32, Box<dyn std::error::Error>> {
+    let from_stdin = [&args.base, &args.ours, &args.theirs].iter().filter(|p| **p == "-").count();
+    if from_stdin > 1 {
+        return Err(
+            "stdin can be used only once: give at most one of BASE, OURS and THEIRS as `-`".into(),
+        );
+    }
     let format = resolve(args.format, &args.base);
     let base_text = read(&args.base)?;
     let options = drift::formats::ParseOptions { xml_arrays: args.xml_arrays };
