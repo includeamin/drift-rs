@@ -1,8 +1,10 @@
 //! Three-way merge of two documents that both changed from a common base.
 
+use crate::diff::identity;
 use crate::join_pointer;
 use serde::Serialize;
 use serde_json::{Map, Value};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 /// The outcome of a merge.
 #[derive(Debug, Clone, PartialEq)]
@@ -115,6 +117,25 @@ fn node(
         };
         return Some(Value::Object(object(b, o, t, path, ctx)));
     }
+    if let (Some(Value::Array(b)), Some(Value::Array(o)), Some(Value::Array(t))) =
+        (base, ours, theirs)
+    {
+        if let Some(key) = usable_key([b, o, t], &ctx.options.array_keys) {
+            let key = key.to_string();
+            return keyed_array(b, o, t, &key, path, ctx);
+        }
+    }
+    conflict(base, ours, theirs, path, ctx)
+}
+
+/// Resolve a disagreement by `prefer`, or record it.
+fn conflict(
+    base: Option<&Value>,
+    ours: Option<&Value>,
+    theirs: Option<&Value>,
+    path: &str,
+    ctx: &mut Ctx,
+) -> Option<Value> {
     match ctx.options.prefer {
         Some(Side::Ours) => ours.cloned(),
         Some(Side::Theirs) => theirs.cloned(),
@@ -128,6 +149,122 @@ fn node(
             None
         }
     }
+}
+
+/// The first key identifying every item of all three arrays, uniquely within
+/// each array. Empty arrays qualify.
+fn usable_key<'a>(arrays: [&[Value]; 3], keys: &'a [String]) -> Option<&'a str> {
+    keys.iter().map(String::as_str).find(|key| {
+        arrays.iter().all(|items| {
+            let ids: Option<Vec<String>> = items.iter().map(|i| identity(i, key)).collect();
+            ids.is_some_and(|ids| ids.iter().collect::<BTreeSet<_>>().len() == ids.len())
+        })
+    })
+}
+
+/// Merge arrays item by item, matching items by `key`.
+fn keyed_array(
+    base: &[Value],
+    ours: &[Value],
+    theirs: &[Value],
+    key: &str,
+    path: &str,
+    ctx: &mut Ctx,
+) -> Option<Value> {
+    let ids = |items: &[Value]| -> Vec<String> {
+        items.iter().filter_map(|i| identity(i, key)).collect()
+    };
+    let (b_ids, o_ids, t_ids) = (ids(base), ids(ours), ids(theirs));
+    let b_set: HashSet<&String> = b_ids.iter().collect();
+    let o_set: HashSet<&String> = o_ids.iter().collect();
+    let t_set: HashSet<&String> = t_ids.iter().collect();
+
+    // Order of the items a side shares with another array.
+    let shared = |list: &[String], other: &HashSet<&String>| -> Vec<String> {
+        list.iter().filter(|i| other.contains(i)).cloned().collect()
+    };
+    let o_reordered = shared(&o_ids, &b_set) != shared(&b_ids, &o_set);
+    let t_reordered = shared(&t_ids, &b_set) != shared(&b_ids, &t_set);
+    if o_reordered && t_reordered && shared(&o_ids, &t_set) != shared(&t_ids, &o_set) {
+        return conflict(
+            Some(&Value::Array(base.to_vec())),
+            Some(&Value::Array(ours.to_vec())),
+            Some(&Value::Array(theirs.to_vec())),
+            path,
+            ctx,
+        );
+    }
+
+    // Merge every item present anywhere: base order, then new in ours, then theirs.
+    let position = |ids: &[String]| -> HashMap<String, usize> {
+        ids.iter().cloned().enumerate().map(|(i, id)| (id, i)).collect()
+    };
+    let (b_pos, o_pos, t_pos) = (position(&b_ids), position(&o_ids), position(&t_ids));
+    let all = b_ids
+        .iter()
+        .chain(o_ids.iter().filter(|i| !b_set.contains(i)))
+        .chain(t_ids.iter().filter(|i| !b_set.contains(i) && !o_set.contains(i)));
+    let mut merged: HashMap<&String, Value> = HashMap::new();
+    for id in all {
+        let (b, o, t) = (
+            b_pos.get(id).map(|&i| &base[i]),
+            o_pos.get(id).map(|&i| &ours[i]),
+            t_pos.get(id).map(|&i| &theirs[i]),
+        );
+        let index = b_pos.get(id).or_else(|| o_pos.get(id)).or_else(|| t_pos.get(id)).copied();
+        let child = join_pointer(path, &index.unwrap_or(0).to_string());
+        if let Some(value) = node(b, o, t, &child, ctx) {
+            merged.insert(id, value);
+        }
+    }
+
+    // The reordering side gives the skeleton; ours when neither reordered.
+    let (skeleton_ids, other_ids, other_set) = if t_reordered && !o_reordered {
+        (&t_ids, &o_ids, &o_set)
+    } else {
+        (&o_ids, &t_ids, &t_set)
+    };
+    let skeleton: Vec<&String> = skeleton_ids.iter().filter(|i| merged.contains_key(i)).collect();
+
+    // Items only the other side added, grouped under their nearest preceding
+    // item of that side which is kept (None: the front).
+    let skeleton_set: HashSet<&&String> = skeleton.iter().collect();
+    let mut runs: HashMap<Option<&String>, Vec<&String>> = HashMap::new();
+    let mut anchor: Option<&String> = None;
+    for id in other_ids {
+        if skeleton_set.contains(&id) {
+            anchor = Some(id);
+        } else if !b_set.contains(id) && merged.contains_key(id) {
+            runs.entry(anchor).or_default().push(id);
+        }
+    }
+
+    let mut out: Vec<Value> = Vec::new();
+    let mut at = 0;
+    let mut anchor: Option<&String> = None;
+    loop {
+        let own_start = at;
+        while at < skeleton.len() && !other_set.contains(skeleton[at]) {
+            at += 1;
+        }
+        let own = &skeleton[own_start..at];
+        let theirs_run = runs.remove(&anchor).unwrap_or_default();
+        // Both sides added here: the smaller identity goes first.
+        let other_first = match (own.first(), theirs_run.first()) {
+            (Some(a), Some(b)) => b < a,
+            _ => true,
+        };
+        let (first, second): (&[&String], &[&String]) =
+            if other_first { (&theirs_run, own) } else { (own, &theirs_run) };
+        out.extend(first.iter().chain(second.iter()).filter_map(|id| merged.remove(*id)));
+        if at >= skeleton.len() {
+            break;
+        }
+        anchor = Some(skeleton[at]);
+        out.extend(merged.remove(skeleton[at]));
+        at += 1;
+    }
+    Some(Value::Array(out))
 }
 
 /// Merge objects key by key: base order, then keys new in ours, then in theirs.
@@ -278,6 +415,130 @@ mod tests {
                 Some(json!([1])),
                 Some(json!([1, 2])),
                 Some(json!([0, 1]))
+            )])
+        );
+    }
+
+    fn keyed() -> MergeOptions {
+        MergeOptions::new().array_key("id")
+    }
+
+    fn items(ids: &[i64]) -> Value {
+        Value::Array(ids.iter().map(|i| json!({"id": i, "v": 0})).collect())
+    }
+
+    fn ids_of(m: &Merged) -> Vec<i64> {
+        let Merged::Clean(v) = m else { panic!("conflict: {m:?}") };
+        v["items"].as_array().unwrap().iter().map(|i| i["id"].as_i64().unwrap()).collect()
+    }
+
+    fn doc(items: Value) -> Value {
+        json!({ "items": items })
+    }
+
+    #[test]
+    fn keyed_disjoint_item_edits_merge() {
+        let b = doc(json!([{"id":1,"v":0},{"id":2,"v":0}]));
+        let o = doc(json!([{"id":1,"v":5},{"id":2,"v":0}]));
+        let t = doc(json!([{"id":1,"v":0},{"id":2,"v":7}]));
+        let m = merge_with(&b, &o, &t, &keyed());
+        assert_eq!(m, Merged::Clean(doc(json!([{"id":1,"v":5},{"id":2,"v":7}]))));
+    }
+
+    #[test]
+    fn keyed_inserts_on_both_sides_keep_both() {
+        let b = doc(items(&[1, 2]));
+        let o = doc(items(&[1, 2, 3]));
+        let t = doc(items(&[0, 1, 2]));
+        assert_eq!(ids_of(&merge_with(&b, &o, &t, &keyed())), [0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn keyed_same_anchor_inserts_commute() {
+        let b = doc(items(&[1, 2]));
+        let o = doc(items(&[1, 9, 2]));
+        let t = doc(items(&[1, 5, 2]));
+        let a = merge_with(&b, &o, &t, &keyed());
+        let c = merge_with(&b, &t, &o, &keyed());
+        assert_eq!(a, c);
+        assert_eq!(ids_of(&a), [1, 5, 9, 2]);
+    }
+
+    #[test]
+    fn keyed_delete_vs_modify_conflicts_at_item() {
+        let b = doc(json!([{"id":1,"v":0},{"id":2,"v":0}]));
+        let o = doc(json!([{"id":1,"v":0}]));
+        let t = doc(json!([{"id":1,"v":0},{"id":2,"v":9}]));
+        let m = merge_with(&b, &o, &t, &keyed());
+        assert_eq!(
+            m,
+            Merged::Conflicted(vec![conflict(
+                "/items/1",
+                Some(json!({"id":2,"v":0})),
+                None,
+                Some(json!({"id":2,"v":9}))
+            )])
+        );
+    }
+
+    #[test]
+    fn keyed_both_delete_is_clean() {
+        let b = doc(items(&[1, 2]));
+        let o = doc(items(&[2]));
+        let m = merge_with(&b, &o, &o, &keyed());
+        assert_eq!(ids_of(&m), [2]);
+    }
+
+    #[test]
+    fn keyed_one_side_deletes_unchanged_item() {
+        let b = doc(items(&[1, 2]));
+        let o = doc(items(&[2]));
+        assert_eq!(ids_of(&merge_with(&b, &o, &b, &keyed())), [2]);
+        assert_eq!(ids_of(&merge_with(&b, &b, &o, &keyed())), [2]);
+    }
+
+    #[test]
+    fn keyed_one_side_reorders() {
+        let b = doc(json!([{"id":1,"v":0},{"id":2,"v":0}]));
+        let o = doc(json!([{"id":2,"v":0},{"id":1,"v":0}]));
+        let t = doc(json!([{"id":1,"v":4},{"id":2,"v":0}]));
+        let want = Merged::Clean(doc(json!([{"id":2,"v":0},{"id":1,"v":4}])));
+        assert_eq!(merge_with(&b, &o, &t, &keyed()), want);
+        assert_eq!(merge_with(&b, &t, &o, &keyed()), want);
+    }
+
+    #[test]
+    fn keyed_both_reorder_differently_conflicts_on_array() {
+        let b = doc(items(&[1, 2, 3]));
+        let o = doc(items(&[2, 1, 3]));
+        let t = doc(items(&[3, 2, 1]));
+        let m = merge_with(&b, &o, &t, &keyed());
+        assert_eq!(
+            m,
+            Merged::Conflicted(vec![conflict(
+                "/items",
+                Some(items(&[1, 2, 3])),
+                Some(items(&[2, 1, 3])),
+                Some(items(&[3, 2, 1]))
+            )])
+        );
+        let p = keyed().prefer(Side::Theirs);
+        assert_eq!(ids_of(&merge_with(&b, &o, &t, &p)), [3, 2, 1]);
+    }
+
+    #[test]
+    fn keyed_falls_back_when_key_not_unique() {
+        let b = doc(items(&[1, 2]));
+        let o = doc(json!([{"id":1,"v":0},{"id":1,"v":1}]));
+        let t = doc(items(&[0, 1, 2]));
+        let m = merge_with(&b, &o, &t, &keyed());
+        assert_eq!(
+            m,
+            Merged::Conflicted(vec![conflict(
+                "/items",
+                Some(items(&[1, 2])),
+                Some(o.clone()["items"].clone()),
+                Some(items(&[0, 1, 2]))
             )])
         );
     }
